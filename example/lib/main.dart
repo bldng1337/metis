@@ -19,15 +19,28 @@ Future<void> copyPath(String from, String to) async {
   }
 }
 
-Future<SurrealDB> init(String path) async {
-  final db = await SurrealDB.newFile(path);
-  await db.use(db: "app", namespace: "app");
-  await db.migrate(
+void main() async {
+  await RustLib.init();
+  final testdir = Directory("runtimetest");
+  if (!testdir.existsSync()) testdir.createSync(recursive: true);
+  final file1 = Directory("${testdir.path}/test4.db");
+  if (file1.existsSync()) file1.deleteSync(recursive: true);
+  final file2 = Directory("${testdir.path}/test6.db");
+  if (file2.existsSync()) file2.deleteSync(recursive: true);
+  await test2();
+}
+
+Future<void> test2() async {
+  var rec1;
+  var rec2;
+  var rec3;
+  final db1 = await AdapterSurrealDB.newMem();
+  await db1.use(db: "site", namespace: "data");
+  await db1.setMigrationAdapter(
       version: 1,
-      migrationName: "data",
+      migrationName: "testdata",
       onMigrate: (db, from, to) async {
-        if (from == to) return;
-        print('Migrating from $from to $to');
+        print("Migrating from $from to $to");
       },
       onCreate: (db) async {
         await db.query(query: """
@@ -44,24 +57,9 @@ Future<SurrealDB> init(String path) async {
                       DEFINE FIELD metadata ON TABLE posts FLEXIBLE TYPE object;
                       """);
       });
-  return db;
-}
-
-void main() async {
-  await RustLib.init();
-  final testdir = Directory("runtimetest");
-  if (!testdir.existsSync()) testdir.createSync(recursive: true);
-  final file1 = Directory("${testdir.path}/test4.db");
-  if (file1.existsSync()) file1.deleteSync(recursive: true);
-  final file2 = Directory("${testdir.path}/test6.db");
-  if (file2.existsSync()) file2.deleteSync(recursive: true);
-  var rec1;
-  var rec2;
-  var rec3;
-  final db1 = await init(file1.absolute.path);
-  final crdt = await db1.initCrdtAdapter(
+  print("Version is ${await db1.getAdapter<MigrationAdapter>().getVersion()}");
+  await db1.setCrdtAdapter(
       tablesToSync: {const DBTable("users"), const DBTable("posts")});
-
   final res1 = await db1.insert(res: const DBTable("users"), data: {
     "name": "test",
     "metadata": {"test": "test"},
@@ -78,11 +76,33 @@ void main() async {
     "metadata": {"test": "Some Test"},
   });
   rec3 = res3["id"] as DBRecord;
-  await crdt.waitSync();
-  final db2 = await init(file2.absolute.path);
-  final crdt2 = await db2.initCrdtAdapter(
+  await db1.getAdapter<CrdtAdapter>().waitSync();
+  final db2 = await AdapterSurrealDB.newMem();
+  await db2.use(db: "site", namespace: "data");
+  await db2.setMigrationAdapter(
+      version: 1,
+      migrationName: "testdata",
+      onMigrate: (db, from, to) async {
+        print("Migrating from $from to $to");
+      },
+      onCreate: (db) async {
+        await db.query(query: """
+                      USE NS data;
+                      USE DB site;
+
+                      DEFINE TABLE users SCHEMAFULL;
+                      DEFINE FIELD name ON TABLE users TYPE string;
+                      DEFINE FIELD metadata ON TABLE users FLEXIBLE TYPE object;
+
+                      DEFINE TABLE posts SCHEMAFULL;
+                      DEFINE FIELD title ON TABLE posts TYPE string;
+                      DEFINE FIELD body ON TABLE posts TYPE string;
+                      DEFINE FIELD metadata ON TABLE posts FLEXIBLE TYPE object;
+                      """);
+      });
+  await db2.setCrdtAdapter(
       tablesToSync: {const DBTable("users"), const DBTable("posts")});
-  await crdt2.mergeCrdt(crdt);
+  await db2.getAdapter<CrdtAdapter>().mergeCrdt(db1.getAdapter());
   print("Users should be (${await db1.select(res: const DBTable("users"))})");
   print("Users is(${await db2.select(res: const DBTable("users"))})");
   await db2.updateMerge(res: rec1 as DBRecord, data: {
@@ -100,9 +120,9 @@ void main() async {
     "name": "Some other update",
     "metadata": {"test": "Yeet"},
   });
-  await crdt.waitSync();
-  await crdt2.waitSync();
-  await crdt2.merge(db1);
+  await db1.getAdapter<CrdtAdapter>().waitSync();
+  await db2.getAdapter<CrdtAdapter>().waitSync();
+  await db2.getAdapter<CrdtAdapter>().merge(db1);
   print("Users is(${await db2.select(res: const DBTable("users"))})");
   print("Posts is(${await db2.select(res: const DBTable("posts"))})");
 }

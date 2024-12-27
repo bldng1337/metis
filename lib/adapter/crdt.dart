@@ -3,24 +3,26 @@ import 'dart:async';
 import 'package:async_locks/async_locks.dart';
 import 'package:crdt/crdt.dart';
 import 'package:flutter_surrealdb/flutter_surrealdb.dart';
+import 'package:metis/client.dart';
 import 'package:metis/adapter.dart';
 import 'package:metis/adapter/migration.dart';
 import 'package:uuid/uuid.dart';
 
-extension CrdtAdapterExt on SurrealDB {
-  Future<CrdtAdapter> initCrdtAdapter({
+extension AdapterCrdtExt on AdapterSurrealDB {
+  Future<CrdtAdapter> setCrdtAdapter({
     required Set<DBTable> tablesToSync,
     String crdtTableName = "_crdt",
     String migrationTableName = "_version",
+    String? name,
   }) async {
-    final adapter = CrdtAdapter(
-      db: this,
-      tablesToSync: tablesToSync,
-      crdtTableName: crdtTableName,
-      migrationTableName: migrationTableName,
-    );
-    await adapter.init();
-    return adapter;
+    return await setAdapter(
+        CrdtAdapter(
+          db: this,
+          tablesToSync: tablesToSync,
+          crdtTableName: crdtTableName,
+          migrationTableName: migrationTableName,
+        ),
+        name: name);
   }
 }
 
@@ -58,13 +60,16 @@ class CrdtAdapter extends Adapter {
 
   @override
   Future<void> init() async {
-    await db.migrate(
+    final migration = MigrationAdapter(
+      db: db,
       version: version,
       migrationName: "crdt$crdtTableName",
       onMigrate: onMigrate,
       onCreate: onCreate,
       migrationTableName: migrationTableName,
     );
+    await migration.init();
+    await migration.dispose();
     await _initTableSync();
   }
 
@@ -145,7 +150,7 @@ class CrdtAdapter extends Adapter {
             hlcEntry["deleted"] = true;
             break;
         }
-        hlc=hlc.increment(wallTime: tosync.modified);
+        hlc = hlc.increment(wallTime: tosync.modified);
         hlcEntry["hlc"] = hlc.toString();
         await db.upsert(
           res: _getSyncRecord(tosync.notification.value["id"]),
@@ -166,12 +171,19 @@ class CrdtAdapter extends Adapter {
     await _syncWorker(force: true);
     _syncing = true;
     await _hlc.run(() async {
-      if (await other.getVersion(
-              migrationName: "crdt$crdtTableName",
-              migrationTableName: migrationTableName) !=
-          version) {
+      final migration = MigrationAdapter(
+        db: other,
+        version: version,
+        migrationName: "crdt$crdtTableName",
+        onMigrate: onMigrate,
+        onCreate: onCreate,
+        migrationTableName: migrationTableName,
+      );
+      if (await migration.getVersion() != version) {
+        await migration.dispose();
         throw Exception("Incompatible version");
       }
+      await migration.dispose();
       int offset = 0;
       while (true) {
         final [syncdata] = await other.query(query: """
