@@ -17,7 +17,7 @@ dependencies:
   flutter_surrealdb:
     git:
       url: https://github.com/bldng1337/flutter_surrealdb.git
-      ref: cfce3fba0178bc1b875db26d05ab4cd4a3d3dd2b
+      ref: 67523fc2a2a2de826b5caa1d925ec0e19e901167
 
 dev_dependencies:
   flutter_test:
