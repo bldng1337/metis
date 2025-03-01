@@ -54,9 +54,7 @@ class MigrationAdapter extends Adapter {
   });
 
   @override
-  Future<void> init() async {}
-
-  Future<void> migrate() async {
+  Future<void> init() async {
     final record = _getRecord();
     final versionmeta = await db.select(res: record);
     final currversion = versionmeta?["version"] as int?;

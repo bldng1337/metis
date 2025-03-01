@@ -48,7 +48,6 @@ class CrdtAdapter extends Adapter {
   static const version = 1;
 
   final Lock _hlc = Lock();
-  bool _syncing = false;
   final List<SyncData> _tosyncdata = List.empty(growable: true);
 
   CrdtAdapter({
@@ -169,7 +168,6 @@ class CrdtAdapter extends Adapter {
 
   Future<void> merge(SurrealDB other, {int chunkSize = 50}) async {
     await _syncWorker(force: true);
-    _syncing = true;
     await _hlc.run(() async {
       final migration = MigrationAdapter(
         db: other,
@@ -179,9 +177,10 @@ class CrdtAdapter extends Adapter {
         onCreate: onCreate,
         migrationTableName: migrationTableName,
       );
-      if (await migration.getVersion() != version) {
+      final otherVersion = await migration.getVersion();
+      if (otherVersion != version) {
         await migration.dispose();
-        throw Exception("Incompatible version");
+        throw Exception("Incompatible version $otherVersion != $version");
       }
       await migration.dispose();
       int offset = 0;
@@ -196,8 +195,9 @@ class CrdtAdapter extends Adapter {
       }
     });
     await Future.value(); // let watch worker run
-    _syncing = false;
   }
+
+  
 
   Future<void> _syncEntry(sync, SurrealDB other) async {
     final localEntry = await db.select(res: sync["id"] as DBRecord);
