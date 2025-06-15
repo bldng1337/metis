@@ -128,10 +128,8 @@ Future<void> test2() async {
 }
 
 Future<void> printDB(SurrealDB db) async {
-  await db.lock((db) async {
-    final users = await db.select(res: const DBTable("users"));
-    print("Users is(${users.length}): $users");
-  });
+  final users = await db.select(res: const DBTable("users"));
+  print("Users is(${users.length}): $users");
 }
 
 class MyApp extends StatelessWidget {

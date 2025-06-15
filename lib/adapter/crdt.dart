@@ -197,8 +197,6 @@ class CrdtAdapter extends Adapter {
     await Future.value(); // let watch worker run
   }
 
-  
-
   Future<void> _syncEntry(sync, SurrealDB other) async {
     final localEntry = await db.select(res: sync["id"] as DBRecord);
     if (localEntry == null) {

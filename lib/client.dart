@@ -29,11 +29,6 @@ class AdapterSurrealDB extends SurrealDB {
   }
 
   @override
-  Future<T> lock<T>(Future<T> Function(SurrealDB db) callback) async {
-    return _surreal.lock(callback);
-  }
-
-  @override
   Future<void> export({required String path}) async {
     return _surreal.export(path: path);
   }
@@ -163,8 +158,10 @@ class AdapterSurrealDB extends SurrealDB {
   }
 
   @override
-  void dispose() {//TODO: Think about Adapters
-    _surreal.dispose();
+  void dispose() {
+    disposeAdapters().then((_) {
+      _surreal.dispose();
+    });
   }
 
   @override

@@ -33,7 +33,7 @@ dependencies:
   flutter_surrealdb:
     git:
       url: https://github.com/bldng1337/flutter_surrealdb.git
-      ref: cfce3fba0178bc1b875db26d05ab4cd4a3d3dd2b
+      ref: 14e75f0cd567e9b7f839cf23447c0ee45af35532
   metis:
     path: ../
   # The following adds the Cupertino Icons font to your application.
