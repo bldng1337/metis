@@ -20,7 +20,9 @@ Future<void> copyPath(String from, String to) async {
 }
 
 void main() async {
+  print("Hello World");
   await RustLib.init();
+  print("Hello World 2");
   final testdir = Directory("runtimetest");
   if (!testdir.existsSync()) testdir.createSync(recursive: true);
   final file1 = Directory("${testdir.path}/test4.db");
