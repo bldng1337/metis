@@ -1,7 +1,6 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:flutter_surrealdb/flutter_surrealdb.dart';
 import 'package:metis/metis.dart';
 import 'package:path/path.dart' as p;
 
