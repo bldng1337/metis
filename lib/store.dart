@@ -7,6 +7,20 @@ class KeyValueStore {
   final String tableName;
   KeyValueStore(this.db, this.tableName);
 
+  static Future<KeyValueStore> newFile(String path) async {
+    final db = await SurrealDB.newFile(path);
+    await db.useDb(db: "keyvalue");
+    await db.useNs(namespace: "keyvalue");
+    return KeyValueStore(db, 'keyvalue');
+  }
+
+  static Future<KeyValueStore> newMem() async {
+    final db = await SurrealDB.newMem();
+    await db.useDb(db: "keyvalue");
+    await db.useNs(namespace: "keyvalue");
+    return KeyValueStore(db, 'keyvalue');
+  }
+
   Future<void> set(String key, dynamic value) async {
     await db.upsert(
       res: DBRecord(tableName, key),
@@ -19,9 +33,12 @@ class KeyValueStore {
     return record?["value"];
   }
 
-  Stream<String> watch(String key) {
+  Stream<dynamic> watch(String key) {
     return db.watch(res: DBRecord(tableName, key)).map((event) {
-      return event.value["value"];
+      if (event.action == Action.delete) {
+        return null;
+      }
+      return event.value?["value"];
     });
   }
 
