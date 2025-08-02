@@ -1,10 +1,12 @@
-import 'package:flutter_surrealdb/flutter_surrealdb.dart';
-import 'package:metis/client.dart';
-import 'package:metis/adapter.dart';
+import 'dart:async';
 
-typedef MigrationMigrateFunction = Future<void> Function(
+import 'package:flutter_surrealdb/flutter_surrealdb.dart';
+import 'package:metis/adapter.dart';
+import 'package:metis/client.dart';
+
+typedef MigrationMigrateFunction = FutureOr<void> Function(
     SurrealDB db, int from, int to);
-typedef MigrationCreateFunction = Future<void> Function(SurrealDB db);
+typedef MigrationCreateFunction = FutureOr<void> Function(SurrealDB db);
 
 extension AdapterMigrationExt on AdapterSurrealDB {
   Future<MigrationAdapter> setMigrationAdapter({
