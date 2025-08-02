@@ -30,6 +30,29 @@ extension AdapterMigrationExt on AdapterSurrealDB {
   }
 }
 
+class VersionRange {
+  final int from;
+  final int to;
+
+  const VersionRange({
+    required this.from,
+    required this.to,
+  });
+  const VersionRange.upto(this.to) : from = 1;
+  const VersionRange.exact(this.from) : to = from;
+
+  VersionRange.fromJson(Map<String, dynamic> json)
+      : from = json['from'],
+        to = json['to'];
+
+  Map<String, dynamic> toJson() => {
+        'from': from,
+        'to': to,
+      };
+
+  bool match(int version) => version >= from && version <= to;
+}
+
 class MigrationAdapter extends Adapter {
   /// The current version of the data.
   final int version;
