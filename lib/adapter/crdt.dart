@@ -37,7 +37,7 @@ class ToSyncData {
 
   DBRecord get id => notification.value['id'];
 
-  SyncData toSyncData() => SyncData(
+  SyncData createSyncData() => SyncData(
         hlc: Hlc.zero(const Uuid().v4()),
         deleted: notification.action == Action.delete,
         entry: notification.value['id'],
@@ -59,10 +59,14 @@ class CrdtAdapterRepo extends SyncRepo {
   Future<List<SyncData>> _querySyncData(int offset, int limit) async {
     final data = await adapter.db.query(
         query: """
-                      RETURN SELECT * FROM ${adapter.crdtTableName} LIMIT \$limit START \$offset*\$limit;
+                      RETURN SELECT * FROM type::table(\$table) LIMIT \$limit START \$offset*\$limit;
                       """
             .trim(),
-        vars: {"offset": offset, "limit": limit});
+        vars: {
+          "offset": offset,
+          "limit": limit,
+          "table": adapter.crdtTableName
+        });
     final List<dynamic> list = data[0];
     return list.map((e) => SyncData.fromJson(e)).toList();
   }
@@ -110,8 +114,11 @@ class CrdtAdapterRepo extends SyncRepo {
   Future<SyncRepoData> getSyncPointData() async {
     return SyncRepoData(
         version: 1,
-        entries: (await adapter.db
-                .query(query: 'COUNT(SELECT * FROM ${adapter.crdtTableName})'))
+        entries: (await adapter.db.query(
+                query: 'COUNT(SELECT * FROM type::table(\$table))',
+                vars: {
+              "table": adapter.crdtTableName,
+            }))
             .first,
         tables: adapter.tablesToSync);
   }
@@ -136,7 +143,6 @@ extension on SyncData {
 
 class CrdtAdapter extends Adapter {
   /// The name of the table that stores the CRDT data.
-  /// **Warning:** Dont use User controlled Strings here as it wont get checked against injection attacks.
   final String crdtTableName;
 
   /// Name of the migration table that should be used.
@@ -159,7 +165,9 @@ class CrdtAdapter extends Adapter {
         assert(migrationTableName.isNotEmpty),
         assert(tablesToSync.isNotEmpty),
         assert(crdtTableName.contains(" ") == false),
-        assert(migrationTableName.contains(" ") == false);
+        assert(migrationTableName.contains(" ") == false),
+        assert(RegExp(r'^[a-zA-Z0-9_]+$').hasMatch(crdtTableName)),
+        assert(RegExp(r'^[a-zA-Z0-9_]+$').hasMatch(migrationTableName));
 
   @override
   Future<void> init() async {
@@ -239,7 +247,7 @@ class CrdtAdapter extends Adapter {
       while (_tosyncdata.isNotEmpty) {
         final tosync = _tosyncdata.removeAt(0);
         final SyncData syncdata =
-            (await _getSyncData(tosync.id)) ?? tosync.toSyncData();
+            (await _getSyncData(tosync.id)) ?? tosync.createSyncData();
         syncdata.update(tosync);
         await db.upsert(
           res: _getSyncRecord(tosync.id),
@@ -257,5 +265,3 @@ class CrdtAdapter extends Adapter {
 
   SyncRepo get syncRepo => CrdtAdapterRepo(adapter: this);
 }
-
-

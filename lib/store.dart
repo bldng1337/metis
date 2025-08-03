@@ -33,8 +33,9 @@ class KeyValueStore {
     return record?["value"];
   }
 
-  Stream<dynamic> watch(String key) {
-    return db.watch(res: DBRecord(tableName, key)).map((event) {
+  Stream<dynamic> watch(String key) async* {
+    yield await get(key);
+    yield* db.watch(res: DBRecord(tableName, key)).map((event) {
       if (event.action == Action.delete) {
         return null;
       }

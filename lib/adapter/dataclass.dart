@@ -43,17 +43,33 @@ class DBDataClassAdapter extends Adapter {
 
   Future<void> delete(DBDataClass data) async {
     if (data.deleted) return;
-    await db.delete(res: data.id);
-    data._deleted = true;
-    _cache.remove(data.id);
+    try {
+      await db.delete(res: data.id);
+      data._deleted = true;
+      _cache.remove(data.id);
+    } catch (e) {
+      rethrow;
+    }
   }
 
   Future<void> save(DBDataClass data) async {
     if (data.deleted) return;
     if (data._loadId != data.id && data._loadId != null) {
       //TODO: Do this in one transaction
-      await db.upsert(res: data.id, data: data.json);
-      await db.delete(res: data._loadId!);
+      await db.query(
+          query: """
+        BEGIN TRANSACTION;
+        DELETE type::thing(\$table, \$oldid);
+        CREATE type::thing(\$table, \$id) CONTENT \$data;
+        COMMIT TRANSACTION;
+      """
+              .trim(),
+          vars: {
+            "table": data.id.tb,
+            "id": data.id.id,
+            "data": data.json,
+            "oldid": data._loadId!.id,
+          });
       _cache.remove(data._loadId);
       data._loadId = data.id;
       _cache[data.id] = data;
@@ -85,6 +101,9 @@ class DBDataClassAdapter extends Adapter {
 
   void registerDataClass<T extends DBDataClass>(
       FutureOr<T> Function(Map<String, dynamic> data) loader) {
+    if (_classes.containsKey(T)) {
+      throw StateError('Data class $T is already registered');
+    }
     _classes[T] = loader;
   }
 
@@ -96,7 +115,7 @@ class DBDataClassAdapter extends Adapter {
     for (final id in ids) {
       final data = await db.select(res: id);
       if (data == null) continue;
-      yield* _load([data as Map<String, dynamic>]);
+      yield* _load<T>([data as Map<String, dynamic>]);
     }
   }
 
@@ -121,7 +140,10 @@ class DBDataClassAdapter extends Adapter {
   }
 
   @override
-  Future<void> dispose() async {}
+  Future<void> dispose() async {
+    _cache.clear();
+    _classes.clear();
+  }
 
   @override
   Future<void> init() async {}

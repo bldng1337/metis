@@ -14,13 +14,8 @@ class TestData with DBDataClass {
     required this.numint,
   });
 
-  TestData.raw({
-    required this.test,
-    required this.numint,
-  });
-
   factory TestData.fromJson(Map<String, dynamic> json) {
-    return TestData.raw(
+    return TestData(
       test: json['test'] as String?,
       numint: json['numint'] as int,
     );
@@ -38,8 +33,7 @@ class AsyncTestData with DBDataClass {
   final double somenum;
 
   @override
-  DBRecord get id => DBRecord('AsyncTestData', '$somedata$somenum');
-
+  DBRecord get id => DBRecord('AsyncTestData', '${somedata}_$somenum');
   AsyncTestData({
     required this.somedata,
     required this.somenum,
@@ -61,7 +55,6 @@ class AsyncTestData with DBDataClass {
 }
 
 void main() {
-  setUpAll(() async => await RustLib.init());
   test('Can use a dataclass to store and retrieve data', () async {
     final db = await AdapterSurrealDB.newMem();
     await db.use(

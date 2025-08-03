@@ -37,13 +37,18 @@ class VersionRange {
   const VersionRange({
     required this.from,
     required this.to,
-  });
+  }) : assert(from <= to, 'from must be less than or equal to to');
+
   const VersionRange.upto(this.to) : from = 1;
   const VersionRange.exact(this.from) : to = from;
 
   VersionRange.fromJson(Map<String, dynamic> json)
       : from = json['from'],
-        to = json['to'];
+        to = json['to'],
+        assert(json['from'] is int),
+        assert(json['to'] is int),
+        assert(json['from'] <= json['to'],
+            'from must be less than or equal to to');
 
   Map<String, dynamic> toJson() => {
         'from': from,

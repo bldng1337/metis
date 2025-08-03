@@ -77,8 +77,9 @@ class SyncRepoData {
   SyncRepoData.fromJson(Map<String, dynamic> json)
       : version = json['version'],
         entries = json['entries'],
-        tables = json['tables'].map((e) => SyncTable.fromJson(e)).toSet();
-
+        tables = (json['tables'] as List<dynamic>? ?? [])
+            .map((e) => SyncTable.fromJson(e as Map<String, dynamic>))
+            .toSet();
   Map<String, dynamic> toJson() => {
         'version': version,
         'entries': entries,
@@ -89,7 +90,7 @@ class SyncRepoData {
 abstract class SyncRepo {
   Future<SyncRepoData> getSyncPointData();
 
-  Stream<SyncData> querySyncData(int from, int to);
+  Stream<SyncData> querySyncData(int offset, int limit);
 
   Future<SyncData?> getSyncData(DBRecord id);
 
@@ -141,7 +142,7 @@ abstract class SyncRepo {
         }
         switch (localsync.compareTo(remotesync)) {
           case -1:
-            await remote.push(remotesync, await pull(remotesync));
+            await remote.push(localsync, await pull(localsync));
             break;
           case 0:
             break;

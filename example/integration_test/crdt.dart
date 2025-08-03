@@ -7,21 +7,22 @@ void main() {
   late AdapterSurrealDB db2;
   late CrdtAdapter crdt;
   late CrdtAdapter crdt2;
-  setUpAll(() async => await RustLib.init());
+
   setUp(() async {
+    const tables = {
+      SyncTable(
+        table: DBTable('test'),
+        version: 1,
+        range: VersionRange.exact(1),
+      )
+    };
     db = await AdapterSurrealDB.newMem();
     await db.use(
       db: 'test',
       namespace: 'test',
     );
     crdt = await db.setCrdtAdapter(
-      tablesToSync: {
-        const SyncTable(
-          table: DBTable('test'),
-          version: 1,
-          range: VersionRange.exact(1),
-        )
-      },
+      tablesToSync: tables,
     );
     db2 = await AdapterSurrealDB.newMem();
     await db2.use(
@@ -29,13 +30,7 @@ void main() {
       namespace: 'test',
     );
     crdt2 = await db2.setCrdtAdapter(
-      tablesToSync: {
-        const SyncTable(
-          table: DBTable('test'),
-          version: 1,
-          range: VersionRange.exact(1),
-        )
-      },
+      tablesToSync: tables,
     );
   });
 
@@ -43,9 +38,10 @@ void main() {
     const id = DBRecord('test', 'test');
     await db.insert(res: id, data: {'test': 1});
     await Future.delayed(const Duration(milliseconds: 100));
+    await crdt2.waitSync();
+    await crdt.waitSync();
     await crdt2.sync(crdt.syncRepo);
-    print("Sync done");
-    await Future.delayed(const Duration(milliseconds: 1000));
+
     final data1 = await db.select(res: id);
     final data2 = await db2.select(res: id);
     expect(data1, isNotNull);
@@ -59,6 +55,8 @@ void main() {
     await db.insert(res: id, data: {'test': 1});
     await db2.insert(res: id2, data: {'test': 2});
     await Future.delayed(const Duration(milliseconds: 100));
+    await crdt2.waitSync();
+    await crdt.waitSync();
     await crdt2.sync(crdt.syncRepo);
     final data11 = await db.select(res: id);
     final data12 = await db.select(res: id2);
@@ -78,6 +76,8 @@ void main() {
     await Future.delayed(const Duration(milliseconds: 1000));
     await db2.insert(res: id, data: {'test': 2});
     await Future.delayed(const Duration(milliseconds: 100));
+    await crdt2.waitSync();
+    await crdt.waitSync();
     await crdt2.sync(crdt.syncRepo);
     final data1 = await db.select(res: id);
     final data2 = await db2.select(res: id);
@@ -91,14 +91,18 @@ void main() {
     const id = DBRecord('test', 'test');
     await db.insert(res: id, data: {'test': 1});
     await Future.delayed(const Duration(milliseconds: 100));
+    await crdt2.waitSync();
+    await crdt.waitSync();
     await crdt2.sync(crdt.syncRepo);
     final data1 = await db.select(res: id);
     final data2 = await db2.select(res: id);
     expect(data1, isNotNull);
     expect(data2, isNotNull);
     expect(data1['test'], data2['test']);
+    await Future.delayed(const Duration(milliseconds: 1000));
     await db.delete(res: id);
-    await Future.delayed(const Duration(milliseconds: 100));
+    await crdt2.waitSync();
+    await crdt.waitSync();
     await crdt2.sync(crdt.syncRepo);
     final data1a = await db.select(res: id);
     final data2a = await db2.select(res: id);
