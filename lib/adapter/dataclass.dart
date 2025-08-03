@@ -12,16 +12,19 @@ extension AdapterDataClassExt on AdapterSurrealDB {
       setAdapter(DBDataClassAdapter(db: this), name: name);
 }
 
-mixin DBDataClass {
+mixin DBConstClass {
+  FutureOr<Map<String, dynamic>> toDBJson();
+  DBRecord get dbId;
+}
+
+mixin DBModifiableClass on DBConstClass {
   bool _deleted = false;
   DBRecord? _loadId;
 
   bool get deleted => _deleted;
-  Map<String, dynamic> get json;
-  DBRecord get id;
 }
 
-mixin DBDataClassSaveable on DBDataClass {
+mixin DBSaveableClass on DBModifiableClass {
   DBDataClassAdapter get _db;
 
   Future<void> save() async {
@@ -35,27 +38,29 @@ mixin DBDataClassSaveable on DBDataClass {
 
 class DBDataClassAdapter extends Adapter {
   final _classes = <Type, dynamic>{};
-  final _cache = WeakCache<DBRecord, DBDataClass>();
+  final _cache = WeakCache<DBRecord, DBConstClass>();
 
   int get loadedClasses => _cache.length;
 
   DBDataClassAdapter({required super.db});
 
-  Future<void> delete(DBDataClass data) async {
-    if (data.deleted) return;
+  Future<void> delete(DBConstClass data) async {
+    if (data is DBModifiableClass && data.deleted) return;
     try {
-      await db.delete(res: data.id);
-      data._deleted = true;
-      _cache.remove(data.id);
+      await db.delete(res: data.dbId);
+      if (data is DBModifiableClass) data._deleted = true;
+      _cache.remove(data.dbId);
     } catch (e) {
       rethrow;
     }
   }
 
-  Future<void> save(DBDataClass data) async {
-    if (data.deleted) return;
-    if (data._loadId != data.id && data._loadId != null) {
-      //TODO: Do this in one transaction
+  Future<void> save(DBConstClass data) async {
+    if (data is DBModifiableClass && data.deleted) return;
+    if (data is DBModifiableClass &&
+        data._loadId != data.dbId &&
+        data._loadId != null) {
+      // update db pos as it has changed
       await db.query(
           query: """
         BEGIN TRANSACTION;
@@ -65,22 +70,22 @@ class DBDataClassAdapter extends Adapter {
       """
               .trim(),
           vars: {
-            "table": data.id.tb,
-            "id": data.id.id,
-            "data": data.json,
+            "table": data.dbId.tb,
+            "id": data.dbId.id,
+            "data": await data.toDBJson(),
             "oldid": data._loadId!.id,
           });
       _cache.remove(data._loadId);
-      data._loadId = data.id;
-      _cache[data.id] = data;
+      data._loadId = data.dbId;
+      _cache[data.dbId] = data;
       return;
     }
-    await db.upsert(res: data.id, data: data.json);
-    _cache[data.id] = data;
-    data._loadId = data.id;
+    await db.upsert(res: data.dbId, data: await data.toDBJson());
+    _cache[data.dbId] = data;
+    if (data is DBModifiableClass) data._loadId = data.dbId;
   }
 
-  Stream<T> _load<T extends DBDataClass>(
+  Stream<T> _load<T extends DBConstClass>(
       Iterable<Map<String, dynamic>> data) async* {
     for (final item in data) {
       final id = item['id'] as DBRecord;
@@ -89,17 +94,19 @@ class DBDataClassAdapter extends Adapter {
         continue;
       }
       final T dataclass = await _classes[T](item);
-      dataclass._loadId = id;
-      if (dataclass._loadId != dataclass.id) {
-        throw StateError(
-            'Dataclass id should only be dependent on the contents of the dataclass');
+      if (dataclass is DBModifiableClass) {
+        dataclass._loadId = id;
+        if (dataclass._loadId != dataclass.dbId) {
+          throw StateError(
+              'Dataclass id should only be dependent on the contents of the dataclass expected $id got ${dataclass.dbId}');
+        }
       }
       _cache[id] = dataclass;
       yield dataclass;
     }
   }
 
-  void registerDataClass<T extends DBDataClass>(
+  void registerDataClass<T extends DBConstClass>(
       FutureOr<T> Function(Map<String, dynamic> data) loader) {
     if (_classes.containsKey(T)) {
       throw StateError('Data class $T is already registered');
@@ -107,7 +114,7 @@ class DBDataClassAdapter extends Adapter {
     _classes[T] = loader;
   }
 
-  Stream<T> selectDataClasses<T extends DBDataClass>(
+  Stream<T> selectDataClasses<T extends DBConstClass>(
       Iterable<DBRecord> ids) async* {
     if (!_classes.containsKey(T)) {
       throw StateError('Class $T not registered');
@@ -119,7 +126,7 @@ class DBDataClassAdapter extends Adapter {
     }
   }
 
-  Future<T?> selectDataClass<T extends DBDataClass>(DBRecord id) async {
+  Future<T?> selectDataClass<T extends DBConstClass>(DBRecord id) async {
     if (!_classes.containsKey(T)) {
       throw StateError('Class $T not registered');
     }
@@ -128,7 +135,7 @@ class DBDataClassAdapter extends Adapter {
     return _load<T>([data as Map<String, dynamic>]).first;
   }
 
-  Stream<T> queryDataClasses<T extends DBDataClass>({
+  Stream<T> queryDataClasses<T extends DBConstClass>({
     required String query,
     Map<String, dynamic>? vars,
   }) async* {
