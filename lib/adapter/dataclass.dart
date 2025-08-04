@@ -24,7 +24,7 @@ mixin DBModifiableClass on DBConstClass {
   bool get deleted => _deleted;
 }
 
-mixin DBSaveableClass on DBModifiableClass {
+mixin DBSaveableClass on DBConstClass {
   DBDataClassAdapter get _db;
 
   Future<void> save() async {
