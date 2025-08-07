@@ -142,21 +142,28 @@ class DBDataClassAdapter extends Adapter {
     yield* _load(data.where((item) => item != null).cast());
   }
 
-  Stream<List<T>> watchDataClasses<T extends DBConstClass>(DBTable id) async* {
+  Stream<List<T>> watchDataClasses<T extends DBConstClass>(
+      DBTable table) async* {
     if (!_classes.containsKey(T)) {
       throw StateError('Class $T not registered');
     }
-    yield await _load<T>(((await db.select(res: id)) as List<dynamic>).cast())
-        .toList();
-    yield* db.watch(res: id).where((event) => event.value != null).asyncMap(
-        (event) => _load<T>((event.value as List<dynamic>).cast()).toList());
+    final data = await db.select(res: table);
+    if (data != null && data is List) {
+      yield await _load<T>(data.cast()).toList();
+    }
+    yield* db.watch(res: table).where((event) => event.value != null).asyncMap(
+          (event) => _load<T>((event.value as List<dynamic>).cast()).toList(),
+        );
   }
 
   Stream<T> watchDataClass<T extends DBConstClass>(DBRecord id) async* {
     if (!_classes.containsKey(T)) {
       throw StateError('Class $T not registered');
     }
-    yield* _load<T>([(await db.select(res: id)) as Map<String, dynamic>]);
+    final data = await db.select(res: id);
+    if (data != null) {
+      yield* _load<T>([data as Map<String, dynamic>]);
+    }
     yield* db
         .watch(res: id)
         .where((event) => event.value != null)
