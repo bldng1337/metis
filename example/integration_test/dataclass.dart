@@ -31,11 +31,11 @@ class TestData with DBConstClass, DBModifiableClass {
 }
 
 class AsyncTestData with DBConstClass, DBModifiableClass {
-  final int somedata;
+  int somedata;
   final double somenum;
 
   @override
-  DBRecord get dbId => DBRecord('AsyncTestData', '${somedata}_$somenum');
+  DBRecord get dbId => DBRecord('AsyncTestData', '$somenum');
   AsyncTestData({
     required this.somedata,
     required this.somenum,
@@ -57,6 +57,22 @@ class AsyncTestData with DBConstClass, DBModifiableClass {
       'somenum': somenum,
     };
   }
+
+  @override
+  String toString() {
+    return 'AsyncTestData(somedata: $somedata, somenum: $somenum)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is AsyncTestData &&
+          runtimeType == other.runtimeType &&
+          somedata == other.somedata &&
+          somenum == other.somenum;
+
+  @override
+  int get hashCode => somedata.hashCode ^ somenum.hashCode;
 }
 
 class ConstTestData with DBConstClass {
@@ -87,15 +103,27 @@ class ConstTestData with DBConstClass {
 }
 
 void main() {
-  test('Can use a dataclass to store and retrieve data', () async {
-    final db = await AdapterSurrealDB.newMem();
+  AdapterSurrealDB? _db;
+  late AdapterSurrealDB db;
+  late DBDataClassAdapter data;
+
+  setUp(() async {
+    if (_db != null) {
+      _db!.dispose();
+    }
+    _db = await AdapterSurrealDB.newMem();
+    db = _db!;
     await db.use(
       db: 'test',
       namespace: 'test',
     );
-    final data = await db.setDataClassAdapter();
+    data = await db.setDataClassAdapter();
     data.registerDataClass(AsyncTestData.fromJson);
     data.registerDataClass(TestData.fromJson);
+    data.registerDataClass(ConstTestData.fromJson);
+  });
+
+  test('Can use a dataclass to store and retrieve data', () async {
     final test = TestData(test: 'test', numint: 10);
     await data.save(test);
     expect(data.loadedClasses, 1);
@@ -107,14 +135,6 @@ void main() {
   });
 
   test('Can change id of dataclass', () async {
-    final db = await AdapterSurrealDB.newMem();
-    await db.use(
-      db: 'test',
-      namespace: 'test',
-    );
-    final data = await db.setDataClassAdapter();
-    data.registerDataClass(AsyncTestData.fromJson);
-    data.registerDataClass(TestData.fromJson);
     final test = TestData(test: 'test', numint: 10);
     final previd = test.dbId;
     await data.save(test);
@@ -125,15 +145,6 @@ void main() {
   });
 
   test('Can use const dataclass', () async {
-    final db = await AdapterSurrealDB.newMem();
-    await db.use(
-      db: 'test',
-      namespace: 'test',
-    );
-    final data = await db.setDataClassAdapter();
-    data.registerDataClass(AsyncTestData.fromJson);
-    data.registerDataClass(TestData.fromJson);
-    data.registerDataClass(ConstTestData.fromJson);
     final test = ConstTestData(somedata: 10, somenum: 10);
     final id = test.dbId;
     await data.save(test);
@@ -150,14 +161,6 @@ void main() {
   });
 
   test('Can delete dataclass', () async {
-    final db = await AdapterSurrealDB.newMem();
-    await db.use(
-      db: 'test',
-      namespace: 'test',
-    );
-    final data = await db.setDataClassAdapter();
-    data.registerDataClass(AsyncTestData.fromJson);
-    data.registerDataClass(TestData.fromJson);
     final test = TestData(test: 'test', numint: 10);
     final id = test.dbId;
     await data.save(test);
@@ -169,14 +172,6 @@ void main() {
   });
 
   test('Can use async dataclass', () async {
-    final db = await AdapterSurrealDB.newMem();
-    await db.use(
-      db: 'test',
-      namespace: 'test',
-    );
-    final data = await db.setDataClassAdapter();
-    data.registerDataClass(AsyncTestData.fromJson);
-    data.registerDataClass(TestData.fromJson);
     final test = AsyncTestData(somedata: 10, somenum: 10);
     final id = test.dbId;
     await data.save(test);
@@ -193,14 +188,6 @@ void main() {
   });
 
   test('Only one dataclass is alive at a time', () async {
-    final db = await AdapterSurrealDB.newMem();
-    await db.use(
-      db: 'test',
-      namespace: 'test',
-    );
-    final data = await db.setDataClassAdapter();
-    data.registerDataClass(AsyncTestData.fromJson);
-    data.registerDataClass(TestData.fromJson);
     late final DBRecord id;
     {
       final test = TestData(test: 'test', numint: 10);
@@ -215,5 +202,41 @@ void main() {
     expect(data.loadedClasses, 1);
     test1!.test = 'test2';
     expect(test2!.test, 'test2');
+  });
+
+  test('Can select table', () async {
+    late String table;
+    for (final i in [1, 2, 3]) {
+      final test = TestData(test: 'test', numint: i);
+      table = test.dbId.tb;
+      await data.save(test);
+    }
+    final List<TestData> res =
+        await data.selectDataClasses<TestData>(DBTable(table)).toList();
+    expect(res.length, 3);
+    for (final item in res) {
+      expect(item.dbId.tb, table);
+      expect(item.test, 'test');
+      expect(item.numint, isNotNull);
+    }
+  });
+
+  test('Can watch dataclass', () async {
+    final test = AsyncTestData(somedata: 10, somenum: 10);
+    final id = test.dbId;
+    await data.save(test);
+    expectLater(
+        data.watchDataClass<AsyncTestData>(id),
+        emitsInOrder([
+          AsyncTestData(somedata: 10, somenum: 10),
+          AsyncTestData(somedata: 20, somenum: 10),
+          AsyncTestData(somedata: 30, somenum: 10)
+        ]));
+    await Future.delayed(const Duration(milliseconds: 100));
+    test.somedata = 20;
+    await data.save(test);
+    await Future.delayed(const Duration(milliseconds: 100));
+    test.somedata = 30;
+    await data.save(test);
   });
 }
