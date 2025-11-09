@@ -86,9 +86,9 @@ class MigrationAdapter extends Adapter {
   @override
   Future<void> init() async {
     final record = _getRecord();
-    final versionmeta = await db.select(res: record);
+    final versionmeta = await db.select(record);
     final currversion = versionmeta?["version"] as int?;
-    await db.upsert(res: record, data: {"version": version});
+    await db.upsert(record, {"version": version});
     if (currversion == null) {
       await onCreate(db);
     } else if (currversion != version) {
@@ -99,7 +99,7 @@ class MigrationAdapter extends Adapter {
   DBRecord _getRecord() => DBRecord(migrationTableName, migrationName);
 
   Future<int?> getVersion() async {
-    final versionmeta = await db.select(res: _getRecord());
+    final versionmeta = await db.select(_getRecord());
     return versionmeta?["version"] as int?;
   }
 

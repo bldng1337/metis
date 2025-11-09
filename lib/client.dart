@@ -1,18 +1,19 @@
+import 'dart:async';
+
 import 'package:flutter_surrealdb/flutter_surrealdb.dart';
 import 'package:metis/adapter.dart';
+import 'package:uuid/uuid_value.dart';
 
-class AdapterSurrealDB extends SurrealDB {
+class AdapterSurrealDB implements SurrealDB {
   final SurrealDB _surreal;
   final Map<(Type, String), Adapter> _adapters = {};
 
   AdapterSurrealDB(this._surreal);
 
-  static Future<AdapterSurrealDB> newFile(String path) async {
-    return AdapterSurrealDB(await SurrealDB.newFile(path));
-  }
-
-  static Future<AdapterSurrealDB> newMem() async {
-    return AdapterSurrealDB(await SurrealDB.newMem());
+  static Future<AdapterSurrealDB> connect(String endpoint,
+      {Options? opts}) async {
+    final surreal = await SurrealDB.connect(endpoint, opts: opts);
+    return AdapterSurrealDB(surreal);
   }
 
   Future<T> setAdapter<T extends Adapter>(T adapter, {String? name}) async {
@@ -29,125 +30,93 @@ class AdapterSurrealDB extends SurrealDB {
   }
 
   @override
-  Future<void> export({required String path}) async {
-    return _surreal.export(path: path);
+  Future<String> export({Config? options}) {
+    return _surreal.export(options: options);
   }
 
   @override
-  Future<void> import({required String path}) async {
-    return _surreal.import(path: path);
+  Future<void> import({required String data}) async {
+    return _surreal.import(data: data);
   }
 
   @override
-  Future<dynamic> create({required Resource res}) async {
-    return _surreal.create(res: res);
+  Future<dynamic> create(Resource res, dynamic data,
+      {bool? only,
+      Output? output,
+      Duration? timeout,
+      DateTime? version}) async {
+    return _surreal.create(res, data,
+        only: only, output: output, timeout: timeout, version: version);
   }
 
   @override
-  Future<void> delete({required Resource res}) async {
-    return _surreal.delete(res: res);
+  Future<void> delete(Resource thing,
+      {bool? only, Output? output, Duration? timeout}) async {
+    return _surreal.delete(thing, only: only, output: output, timeout: timeout);
   }
 
   @override
-  Future<dynamic> select({required Resource res}) async {
-    return _surreal.select(res: res);
+  Future<dynamic> select(Resource thing) async {
+    return _surreal.select(thing);
   }
 
   @override
-  Stream<DBNotification> watch({required Resource res}) {
-    return _surreal.watch(res: res);
+  Stream<Notification> live(DBTable table, {bool? diff}) {
+    return _surreal.live(table);
   }
 
   @override
-  Future<dynamic> updateContent(
-      {required Resource res, required dynamic data}) async {
-    return _surreal.updateContent(res: res, data: data);
+  Future<List<dynamic>> insert(
+    DBTable thing,
+    dynamic data, {
+    InsertDataExpr? dataExpr,
+    bool? relation,
+    Output? output,
+    Duration? timeout,
+    DateTime? version,
+    Map<String, dynamic>? vars,
+  }) async {
+    return _surreal.insert(thing, data,
+        dataExpr: dataExpr,
+        relation: relation,
+        output: output,
+        timeout: timeout,
+        version: version,
+        vars: vars);
   }
 
   @override
-  Future<dynamic> updateMerge(
-      {required Resource res, required dynamic data}) async {
-    return _surreal.updateMerge(res: res, data: data);
-  }
-
-  @override
-  Future<dynamic> insert({required Resource res, required dynamic data}) async {
-    return _surreal.insert(res: res, data: data);
-  }
-
-  @override
-  Future<dynamic> upsert({required Resource res, required dynamic data}) async {
-    return _surreal.upsert(res: res, data: data);
+  Future<dynamic> upsert(Resource thing, dynamic data) async {
+    return _surreal.upsert(thing, data);
   }
 
   @override
   Future<List<dynamic>> query(
-      {required String query, Map<String, dynamic>? vars}) async {
-    return _surreal.query(query: query, vars: vars);
+    String query, {
+    Map<String, dynamic>? vars,
+    bool throwOnError = true,
+  }) async {
+    return (await _surreal.query(query, vars: vars, throwOnError: throwOnError))
+        as List<dynamic>;
   }
 
   @override
-  Future<dynamic> run({required String function, required dynamic args}) async {
-    return _surreal.run(function: function, args: args);
-  }
-
-  @override
-  Future<void> set({required String key, required dynamic value}) async {
-    return _surreal.set(key: key, value: value);
-  }
-
-  @override
-  Future<void> unset({required String key}) async {
-    return _surreal.unset(key: key);
+  Future<dynamic> run(String function,
+      {List<dynamic>? args, String? version}) async {
+    return _surreal.run(function, args: args, version: version);
   }
 
   // AUTH
 
   @override
-  Future<void> authenticate({required String token}) async {
-    return _surreal.authenticate(token: token);
-  }
-
-  @override
-  Future<String> signin(
-      {required String namespace,
-      required String database,
-      required String access,
-      required dynamic extra}) async {
-    return _surreal.signin(
-        namespace: namespace, database: database, access: access, extra: extra);
-  }
-
-  @override
-  Future<String> signup(
-      {required String namespace,
-      required String database,
-      required String access,
-      required dynamic extra}) async {
-    return _surreal.signup(
-        namespace: namespace, database: database, access: access, extra: extra);
-  }
-
-  // SCOPING
-  @override
-  Future<void> useDb({required String db}) async {
-    return _surreal.useDb(db: db);
-  }
-
-  @override
-  Future<void> useNs({required String namespace}) async {
-    return _surreal.useNs(namespace: namespace);
-  }
-
-  @override
-  Future<void> use({String? db, String? namespace}) async {
-    return _surreal.use(db: db, namespace: namespace);
+  Future<void> use({String? db, String? ns}) async {
+    return _surreal.use(db: db, ns: ns);
   }
 
   // OTHER
   @override
   Future<String> version() async {
-    return _surreal.version();
+    return (await _surreal.version()) as String;
   }
 
   Future<void> disposeAdapters() async {
@@ -164,13 +133,94 @@ class AdapterSurrealDB extends SurrealDB {
     });
   }
 
+  SurrealDB get inner => _surreal;
+
   @override
-  bool get isDisposed {
-    return _surreal.isDisposed;
+  Future<String> engineVersion() {
+    return _surreal.engineVersion();
   }
 
   @override
-  SurrealProxy get rustbinding => _surreal.rustbinding;
+  Future info() {
+    return _surreal.info();
+  }
 
-  SurrealDB get inner => _surreal;
+  @override
+  Future<void> kill(UuidValue id) {
+    return _surreal.kill(id);
+  }
+
+  @override
+  Stream<Notification> liveOf(
+    UuidValue id, {
+    Future<void> Function()? onKill,
+    bool shouldKillOnCancel = true,
+  }) {
+    return _surreal.liveOf(id,
+        onKill: onKill, shouldKillOnCancel: shouldKillOnCancel);
+  }
+
+  @override
+  Future update(Resource thing, data,
+      {DataExpr? dataExpr,
+      bool? only,
+      String? condition,
+      Output? output,
+      Duration? timeout,
+      Map<String, dynamic>? vars}) {
+    return _surreal.update(thing, data,
+        dataExpr: dataExpr,
+        only: only,
+        condition: condition,
+        output: output,
+        timeout: timeout,
+        vars: vars);
+  }
+
+  @override
+  Future<void> authenticate(String token) {
+    return _surreal.authenticate(token);
+  }
+
+  @override
+  Future<void> invalidate() {
+    return _surreal.invalidate();
+  }
+
+  @override
+  Future<void> set(String key, value) {
+    return _surreal.set(key, value);
+  }
+
+  @override
+  Future<dynamic> signin(
+      {String? ns,
+      String? db,
+      String? username,
+      String? password,
+      String? access,
+      required variables}) {
+    return _surreal.signin(
+        ns: ns,
+        db: db,
+        username: username,
+        password: password,
+        access: access,
+        variables: variables);
+  }
+
+  @override
+  Future<dynamic> signup(
+      {required String ns,
+      required String db,
+      required String access,
+      required variables}) {
+    return _surreal.signup(
+        ns: ns, db: db, access: access, variables: variables);
+  }
+
+  @override
+  Future<void> unset(String name) {
+    return _surreal.unset(name);
+  }
 }

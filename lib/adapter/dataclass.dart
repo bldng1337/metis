@@ -47,7 +47,7 @@ class DBDataClassAdapter extends Adapter {
   Future<void> delete(DBConstClass data) async {
     if (data is DBModifiableClass && data.deleted) return;
     try {
-      await db.delete(res: data.dbId);
+      await db.delete(data.dbId);
       if (data is DBModifiableClass) data._deleted = true;
       _cache.remove(data.dbId);
     } catch (e) {
@@ -62,10 +62,10 @@ class DBDataClassAdapter extends Adapter {
         data._loadId != null) {
       // update db pos as it has changed
       await db.query(
-          query: """
+          """
         BEGIN TRANSACTION;
-        DELETE type::thing(\$table, \$oldid);
-        CREATE type::thing(\$table, \$id) CONTENT \$data;
+        DELETE type::record(\$table, \$oldid);
+        CREATE type::record(\$table, \$id) CONTENT \$data;
         COMMIT TRANSACTION;
       """
               .trim(),
@@ -80,7 +80,7 @@ class DBDataClassAdapter extends Adapter {
       _cache[data.dbId] = data;
       return;
     }
-    await db.upsert(res: data.dbId, data: await data.toDBJson());
+    await db.upsert(data.dbId, await data.toDBJson());
     _cache[data.dbId] = data;
     if (data is DBModifiableClass) data._loadId = data.dbId;
   }
@@ -118,7 +118,7 @@ class DBDataClassAdapter extends Adapter {
     if (!_classes.containsKey(T)) {
       throw StateError('Class $T not registered');
     }
-    final List<dynamic> data = await db.select(res: table);
+    final List<dynamic> data = await db.select(table);
     yield* _load<T>(data.cast());
   }
 
@@ -126,9 +126,10 @@ class DBDataClassAdapter extends Adapter {
     if (!_classes.containsKey(T)) {
       throw StateError('Class $T not registered');
     }
-    final data = await db.select(res: id);
+    final data = await db.select(id);
     if (data == null) return null;
-    return _load<T>([data as Map<String, dynamic>]).first;
+    return _load<T>([data.cast<String, dynamic>() as Map<String, dynamic>])
+        .first;
   }
 
   Stream<T> queryDataClasses<T extends DBConstClass>({
@@ -138,7 +139,7 @@ class DBDataClassAdapter extends Adapter {
     if (!_classes.containsKey(T)) {
       throw StateError('Class $T not registered');
     }
-    final data = (await db.query(query: query, vars: vars))[0] as List<dynamic>;
+    final data = (await db.query(query, vars: vars))[0] as List<dynamic>;
     yield* _load(data.where((item) => item != null).cast());
   }
 
@@ -147,30 +148,32 @@ class DBDataClassAdapter extends Adapter {
     if (!_classes.containsKey(T)) {
       throw StateError('Class $T not registered');
     }
-    final data = await db.select(res: table);
+    final data = await db.select(table);
     if (data != null && data is List) {
       yield await _load<T>(data.cast()).toList();
     }
-    yield* db.watch(res: table).where((event) => event.value != null).asyncMap(
-          (event) => _load<T>((event.value as List<dynamic>).cast()).toList(),
+    yield* db.live(table).where((event) => event.result != null).asyncMap(
+          (event) => _load<T>((event.result as List<dynamic>).cast()).toList(),
         );
   }
 
-  Stream<T> watchDataClass<T extends DBConstClass>(DBRecord id) async* {
-    if (!_classes.containsKey(T)) {
-      throw StateError('Class $T not registered');
-    }
-    final data = await db.select(res: id);
-    if (data != null) {
-      yield* _load<T>([data as Map<String, dynamic>]);
-    }
-    yield* db
-        .watch(res: id)
-        .where((event) => event.value != null)
-        .asyncMap((event) async {
-      return await _load<T>([event.value as Map<String, dynamic>]).first;
-    });
-  }
+  // Stream<T> watchDataClass<T extends DBConstClass>(DBRecord id) async* {
+  //   if (!_classes.containsKey(T)) {
+  //     throw StateError('Class $T not registered');
+  //   }
+  //   final data = await db.select(id);
+  //   if (data != null) {
+  //     yield* _load<T>([data as Map<String, dynamic>]);
+  //   }
+  //   final liveid = await db.query("LIVE SELECT * FROM \$table WHERE id==\$id",
+  //       vars: {"id": id, "table": id.table});
+  //   yield* db
+  //       .liveOf(liveid[0])
+  //       .where((event) => event.result != null)
+  //       .asyncMap((event) async {
+  //     return await _load<T>([event.result as Map<String, dynamic>]).first;
+  //   });
+  // }
 
   @override
   Future<void> dispose() async {

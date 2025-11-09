@@ -1,18 +1,16 @@
 import 'dart:async';
 
-import 'package:async_locks/async_locks.dart';
 import 'package:crdt/crdt.dart';
 import 'package:flutter_surrealdb/flutter_surrealdb.dart';
 import 'package:metis/adapter.dart';
 import 'package:metis/adapter/migration.dart';
 import 'package:metis/adapter/sync/repo.dart';
 import 'package:metis/client.dart';
-import 'package:uuid/uuid.dart';
 
 extension AdapterCrdtExt on AdapterSurrealDB {
   Future<CrdtAdapter> setCrdtAdapter({
     required Set<SyncTable> tablesToSync,
-    String crdtTableName = "_crdt",
+    String crdtTableName = "crdt",
     String migrationTableName = "_version",
     String? name,
   }) async {
@@ -27,28 +25,6 @@ extension AdapterCrdtExt on AdapterSurrealDB {
   }
 }
 
-class ToSyncData {
-  final DBNotification notification;
-  final DateTime modified;
-  const ToSyncData({
-    required this.notification,
-    required this.modified,
-  });
-
-  DBRecord get id => notification.value['id'];
-
-  SyncData createSyncData() => SyncData(
-        hlc: Hlc.zero(const Uuid().v4()),
-        deleted: notification.action == Action.delete,
-        entry: notification.value['id'],
-      );
-
-  @override
-  String toString() {
-    return "ToSyncData $notification $modified";
-  }
-}
-
 class CrdtAdapterRepo extends SyncRepo {
   final CrdtAdapter adapter;
 
@@ -58,9 +34,9 @@ class CrdtAdapterRepo extends SyncRepo {
 
   Future<List<SyncData>> _querySyncData(int offset, int limit) async {
     final data = await adapter.db.query(
-        query: """
-                      RETURN SELECT * FROM type::table(\$table) LIMIT \$limit START \$offset*\$limit;
-                      """
+        """
+              RETURN SELECT * FROM type::table(\$table) LIMIT \$limit START \$offset*\$limit;
+              """
             .trim(),
         vars: {
           "offset": offset,
@@ -68,7 +44,7 @@ class CrdtAdapterRepo extends SyncRepo {
           "table": adapter.crdtTableName
         });
     final List<dynamic> list = data[0];
-    return list.map((e) => SyncData.fromJson(e)).toList();
+    return list.map((e) => SyncData.fromDB(e)).toList();
   }
 
   @override
@@ -87,7 +63,7 @@ class CrdtAdapterRepo extends SyncRepo {
     if (!adapter.tablesToSync.any((e) => e.table.tb == meta.entry.tb)) {
       return null;
     }
-    final data = await adapter.db.select(res: meta.entry);
+    final data = await adapter.db.select(meta.entry);
     return data;
   }
 
@@ -96,48 +72,31 @@ class CrdtAdapterRepo extends SyncRepo {
     if (!adapter.tablesToSync.any((e) => e.table.tb == meta.entry.tb)) {
       return;
     }
-    //TODO: Recheck and merge meta data
-    adapter._ignoredids.add(meta.entry);
-    await adapter.db
-        .upsert(res: adapter._getSyncRecord(meta.entry), data: meta);
+    await adapter.db.upsert(
+      adapter._getSyncRecord(meta.entry),
+      meta.toDB(),
+    );
     if (data == null) {
-      await adapter.db.delete(res: meta.entry);
+      // We can't use the delete method here as the current version of surrealdb uses ONLY for the delete method that needs the record to exist which we cannot guarantee
+      await adapter.db.query("DELETE FROM \$entry", vars: {
+        "entry": meta.entry,
+      });
       return;
     }
-    await adapter.db.upsert(
-      res: meta.entry,
-      data: data,
-    );
+    await adapter.db
+        .upsert(meta.entry, data); //TODO: Disable sync for this upsert
   }
 
   @override
   Future<SyncRepoData> getSyncPointData() async {
     return SyncRepoData(
         version: 1,
-        entries: (await adapter.db.query(
-                query: 'COUNT(SELECT * FROM type::table(\$table))',
-                vars: {
-              "table": adapter.crdtTableName,
-            }))
+        entries: (await adapter.db
+                .query('COUNT(SELECT * FROM type::table(\$table))', vars: {
+          "table": adapter.crdtTableName,
+        }))
             .first,
         tables: adapter.tablesToSync);
-  }
-}
-
-extension on SyncData {
-  void update(ToSyncData tosync) {
-    switch (tosync.notification.action) {
-      case Action.create:
-        deleted = false;
-        break;
-      case Action.update:
-        deleted = false;
-        break;
-      case Action.delete:
-        deleted = true;
-        break;
-    }
-    hlc = hlc.increment(wallTime: tosync.modified);
   }
 }
 
@@ -152,14 +111,10 @@ class CrdtAdapter extends Adapter {
   final Set<SyncTable> tablesToSync;
   static const version = 1;
 
-  final Lock _synclock = Lock();
-  final List<DBRecord> _ignoredids = List.empty(growable: true);
-  final List<ToSyncData> _tosyncdata = List.empty(growable: true);
-
   CrdtAdapter({
     required super.db,
     required this.tablesToSync,
-    this.crdtTableName = "_crdt",
+    this.crdtTableName = "crdt",
     this.migrationTableName = "_version",
   })  : assert(crdtTableName.isNotEmpty),
         assert(migrationTableName.isNotEmpty),
@@ -186,75 +141,69 @@ class CrdtAdapter extends Adapter {
 
   Future<void> onCreate(SurrealDB db) async {
     //This is a possible injection point but as far as I can tell its not possible to use the vars for a define statement
-    await db.query(
-        query: """
+    await db.query("""
         DEFINE TABLE $crdtTableName SCHEMAFULL;
-        DEFINE FIELD hlc ON TABLE $crdtTableName TYPE string;
-        DEFINE FIELD deleted ON TABLE $crdtTableName TYPE bool;
-        DEFINE FIELD entry ON TABLE $crdtTableName TYPE record;
+        DEFINE FIELD timestamp ON TABLE $crdtTableName TYPE datetime COMMENT 'The Timestamp of the HLC when the record was last modified';
+        DEFINE FIELD count ON TABLE $crdtTableName TYPE int COMMENT 'The count of the HLC';
+        DEFINE FIELD deleted ON TABLE $crdtTableName TYPE bool COMMENT 'If the record was deleted';
+        DEFINE FIELD entry ON TABLE $crdtTableName TYPE record COMMENT 'The record that was modified';
         """
-            .trim());
+        .trim());
   }
 
   Future<void> onMigrate(SurrealDB db, int from, int to) async {}
 
   @override
-  Future<void> dispose() async {
-    await _syncWorker(force: true);
-  }
+  Future<void> dispose() async {}
 
-  _initTableSync() {
-    for (final synctable in tablesToSync) {
-      db.watch(res: synctable.table).listen((event) {
-        if (_ignoredids.contains(event.value["id"])) {
-          _ignoredids.remove(event.value["id"]);
-          return;
-        }
-        if (_tosyncdata.any(
-            (tosync) => tosync.notification.value["id"] == event.value["id"])) {
-          _tosyncdata.removeWhere(
-              (tosync) => tosync.notification.value["id"] == event.value["id"]);
-        }
-        _tosyncdata.add(
-            ToSyncData(notification: event, modified: DateTime.now().toUtc()));
-        _syncWorker();
-      });
+  Future<void> _initTableSync() async {
+    for (final table in tablesToSync) {
+      //TODO: This is a possible injection point but as far as I can tell its not possible to use the vars for a define statement 2.0
+      await db.query("""
+          DEFINE EVENT IF NOT EXISTS sync ON ${table.table.tb} THEN {
+          let \$entry = type::record("$crdtTableName",[record::tb(\$value.id),record::id(\$value.id)]);
+          let \$now = time::now();
+          let \$deleted = \$event == "DELETE";
+          let \$curr = SELECT * from ONLY \$entry;
+          IF \$curr==null {
+              UPSERT \$entry SET timestamp=\$now, count=0, deleted=\$deleted, entry=\$value.id;
+              RETURN NULL;
+          };
+          IF \$now <= \$curr.timestamp {
+              UPSERT \$entry SET timestamp=\$curr.timestamp, count=\$curr.count+1, deleted=\$deleted, entry=\$value.id;
+              RETURN NULL;
+          };
+          UPSERT \$entry SET timestamp=\$now, count=0, deleted=\$deleted, entry=\$value.id;
+          RETURN NULL;
+          };
+        """);
     }
   }
 
-  DBRecord _getSyncRecord(DBRecord record) {
-    return DBRecord(crdtTableName, "${record.tb}_${record.id}");
+  Future<void> removeSyncTable(SyncTable table) async {
+    await db.query(
+        """
+      REMOVE EVENT IF EXISTS sync ON \$sync_table;
+      """
+            .trim(),
+        vars: {
+          "sync_table": table.table,
+        });
   }
 
-  Future<void> waitSync() async {
-    await _syncWorker(force: true);
+  DBRecord _getSyncRecord(DBRecord record) {
+    return DBRecord(crdtTableName, [record.tb, record.id]);
   }
 
   Future<SyncData?> _getSyncData(DBRecord id) async {
     final entry = await db.select(
-      res: _getSyncRecord(id),
+      _getSyncRecord(id),
     );
     if (entry != null && entry.isNotEmpty) {
-      return SyncData.fromJson(entry);
+      return SyncData.fromDB(entry);
     } else {
       return null;
     }
-  }
-
-  Future<void> _syncWorker({bool force = false}) async {
-    if (_synclock.locked && !force) return;
-    await _synclock.run(() async {
-      while (_tosyncdata.isNotEmpty) {
-        final tosync = _tosyncdata.removeAt(0);
-        final SyncData syncdata =
-            (await _getSyncData(tosync.id)) ?? tosync.createSyncData();
-        syncdata.update(tosync);
-        await db.upsert(
-          res: _getSyncRecord(tosync.id),
-          data: syncdata,
-        );
-      }
-    });
   }
 
   Future<void> sync(SyncRepo remote,

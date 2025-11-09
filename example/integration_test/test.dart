@@ -7,9 +7,9 @@ import 'migration.dart' as migration;
 import 'store.dart' as store;
 
 void main() {
-  setUpAll(() async => await RustLib.init());
-  group('CRDT', crdt.main);
-  group('Dataclass', dataclass.main);
-  group('Migration', migration.main);
-  group('Store', store.main);
+  setUpAll(() async => await SurrealDB.ensureInitialized());
+  group('CRDT', crdt.dotest);
+  group('Dataclass', dataclass.dotest);
+  group('Migration', migration.dotest);
+  group('Store', store.dotest);
 }

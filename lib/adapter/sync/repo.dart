@@ -13,6 +13,12 @@ class SyncData {
     required this.entry,
   });
 
+  SyncData.fromDB(Map<String, dynamic> db)
+      : hlc = Hlc(db['timestamp'] as DateTime, db['count'] as int,
+            db["id"].toString()),
+        deleted = db['deleted'],
+        entry = db['entry'] as DBRecord;
+
   SyncData.fromJson(Map<String, dynamic> json)
       : hlc = Hlc.parse(json['hlc']),
         deleted = json['deleted'],
@@ -26,13 +32,20 @@ class SyncData {
         'entry': entry,
       };
 
+  Map<String, dynamic> toDB() => {
+        'timestamp': hlc.dateTime,
+        'count': hlc.counter,
+        'deleted': deleted,
+        'entry': entry,
+      };
+
   int compareTo(SyncData other) {
     return other.hlc.compareTo(hlc);
   }
 
   @override
   String toString() {
-    return "SyncData $entry $deleted $hlc";
+    return "SyncData($entry, $deleted, $hlc)";
   }
 }
 
@@ -133,8 +146,8 @@ abstract class SyncRepo {
       {int chunkSize = 50,
       void Function(int progress, int total)? onProgress}) async {
     for (int offset = 0; offset < length; offset += chunkSize) {
+      onProgress?.call(offset, length);
       await for (final remotesync in remote.querySyncData(offset, chunkSize)) {
-        onProgress?.call(offset, length);
         final localsync = await getSyncData(remotesync.entry);
         if (localsync == null) {
           await push(remotesync, await remote.pull(remotesync));
