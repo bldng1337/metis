@@ -40,19 +40,13 @@ class AdapterSurrealDB implements SurrealDB {
   }
 
   @override
-  Future<dynamic> create(Resource res, dynamic data,
-      {bool? only,
-      Output? output,
-      Duration? timeout,
-      DateTime? version}) async {
-    return _surreal.create(res, data,
-        only: only, output: output, timeout: timeout, version: version);
+  Future<dynamic> create(Resource res, dynamic data) async {
+    return _surreal.create(res, data);
   }
 
   @override
-  Future<void> delete(Resource thing,
-      {bool? only, Output? output, Duration? timeout}) async {
-    return _surreal.delete(thing, only: only, output: output, timeout: timeout);
+  Future<void> delete(Resource thing) async {
+    return _surreal.delete(thing);
   }
 
   @override
@@ -66,23 +60,8 @@ class AdapterSurrealDB implements SurrealDB {
   }
 
   @override
-  Future<List<dynamic>> insert(
-    DBTable thing,
-    dynamic data, {
-    InsertDataExpr? dataExpr,
-    bool? relation,
-    Output? output,
-    Duration? timeout,
-    DateTime? version,
-    Map<String, dynamic>? vars,
-  }) async {
-    return _surreal.insert(thing, data,
-        dataExpr: dataExpr,
-        relation: relation,
-        output: output,
-        timeout: timeout,
-        version: version,
-        vars: vars);
+  Future<List<dynamic>> insert(DBTable thing, dynamic data) async {
+    return _surreal.insert(thing, data);
   }
 
   @override
@@ -94,10 +73,8 @@ class AdapterSurrealDB implements SurrealDB {
   Future<List<dynamic>> query(
     String query, {
     Map<String, dynamic>? vars,
-    bool throwOnError = true,
   }) async {
-    return (await _surreal.query(query, vars: vars, throwOnError: throwOnError))
-        as List<dynamic>;
+    return (await _surreal.query(query, vars: vars)) as List<dynamic>;
   }
 
   @override
@@ -161,20 +138,8 @@ class AdapterSurrealDB implements SurrealDB {
   }
 
   @override
-  Future update(Resource thing, data,
-      {DataExpr? dataExpr,
-      bool? only,
-      String? condition,
-      Output? output,
-      Duration? timeout,
-      Map<String, dynamic>? vars}) {
-    return _surreal.update(thing, data,
-        dataExpr: dataExpr,
-        only: only,
-        condition: condition,
-        output: output,
-        timeout: timeout,
-        vars: vars);
+  Future update(Resource thing, data) {
+    return _surreal.update(thing, data);
   }
 
   @override
