@@ -85,6 +85,8 @@ class MigrationAdapter extends Adapter {
 
   @override
   Future<void> init() async {
+    await db.query(
+        "DEFINE TABLE IF NOT EXISTS $migrationTableName SCHEMALESS;"); // Ensure the migration table exists
     final record = _getRecord();
     final versionmeta = await db.select(record);
     final currversion = versionmeta?["version"] as int?;
