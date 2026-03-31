@@ -3,9 +3,7 @@ import 'dart:io';
 
 import 'package:crdt/crdt.dart';
 import 'package:flutter_surrealdb/flutter_surrealdb.dart';
-import 'package:metis/adapter/crdt.dart';
 import 'package:metis/adapter/migration.dart';
-import 'package:nsd/nsd.dart';
 
 class SyncData {
   Hlc hlc;
@@ -187,13 +185,13 @@ class VersionMismatchException implements Exception {
     return "VersionMismatchException: $what local: $local remote: $remote";
   }
 }
-
 class SyncHttpClient extends SyncRepo {
   final String url;
-  final client = HttpClient();
+  final HttpClient client;
 
   SyncHttpClient({
     required this.url,
+    required this.client,
   });
 
   Future<String> _request(String path, Object? body) async {

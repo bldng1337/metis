@@ -109,8 +109,9 @@ void dotest() {
 
   test('SyncHttpServer handles /getSyncPointData', () async {
     serveRequests();
-    syncClient =
-        SyncHttpClient(url: 'http://${server.address.host}:${server.port}');
+    syncClient = SyncHttpClient(
+        url: 'http://${server.address.host}:${server.port}',
+        client: HttpClient());
     final result = await syncClient.getSyncPointData();
     expect(result.version, 1);
     expect(result.entries, 1);
@@ -119,8 +120,9 @@ void dotest() {
 
   test('SyncHttpServer handles /getSyncData', () async {
     serveRequests();
-    syncClient =
-        SyncHttpClient(url: 'http://${server.address.host}:${server.port}');
+    syncClient = SyncHttpClient(
+        url: 'http://${server.address.host}:${server.port}',
+        client: HttpClient());
     final result = await syncClient.getSyncData(testRecord);
     expect(result, isNotNull);
     expect(result!.entry, testRecord);
@@ -128,8 +130,9 @@ void dotest() {
 
   test('SyncHttpServer handles /pull', () async {
     serveRequests();
-    syncClient =
-        SyncHttpClient(url: 'http://${server.address.host}:${server.port}');
+    syncClient = SyncHttpClient(
+        url: 'http://${server.address.host}:${server.port}',
+        client: HttpClient());
     final syncData = _makeSyncData('test', 'record1', testTime, 0);
     final result = await syncClient.pull(syncData);
     expect(result, isNotNull);
@@ -138,8 +141,9 @@ void dotest() {
 
   test('SyncHttpServer handles /push', () async {
     serveRequests();
-    syncClient =
-        SyncHttpClient(url: 'http://${server.address.host}:${server.port}');
+    syncClient = SyncHttpClient(
+        url: 'http://${server.address.host}:${server.port}',
+        client: HttpClient());
     final syncData = _makeSyncData('test', 'newrecord', testTime, 0);
     await syncClient.push(syncData, {'new': 'data'});
     expect(
@@ -148,8 +152,9 @@ void dotest() {
 
   test('SyncHttpServer handles /querySyncData', () async {
     serveRequests();
-    syncClient =
-        SyncHttpClient(url: 'http://${server.address.host}:${server.port}');
+    syncClient = SyncHttpClient(
+        url: 'http://${server.address.host}:${server.port}',
+        client: HttpClient());
     final results = await syncClient.querySyncData(0, 10).toList();
     expect(results.length, 1);
     expect(results.first.entry, testRecord);
@@ -157,8 +162,9 @@ void dotest() {
 
   test('SyncHttpServer returns 404 for unknown path', () async {
     serveRequests();
-    syncClient =
-        SyncHttpClient(url: 'http://${server.address.host}:${server.port}');
+    syncClient = SyncHttpClient(
+        url: 'http://${server.address.host}:${server.port}',
+        client: HttpClient());
     try {
       final request = await syncClient.client.postUrl(Uri.parse(
         'http://${server.address.host}:${server.port}/unknown',
@@ -174,8 +180,9 @@ void dotest() {
 
   test('SyncHttpServer returns 400 for non-JSON content type', () async {
     serveRequests();
-    syncClient =
-        SyncHttpClient(url: 'http://${server.address.host}:${server.port}');
+    syncClient = SyncHttpClient(
+        url: 'http://${server.address.host}:${server.port}',
+        client: HttpClient());
     final request = await syncClient.client.postUrl(Uri.parse(
       'http://${server.address.host}:${server.port}/getSyncPointData',
     ));
@@ -187,8 +194,9 @@ void dotest() {
 
   test('SyncHttpClient and SyncHttpServer roundtrip all endpoints', () async {
     serveRequests();
-    syncClient =
-        SyncHttpClient(url: 'http://${server.address.host}:${server.port}');
+    syncClient = SyncHttpClient(
+        url: 'http://${server.address.host}:${server.port}',
+        client: HttpClient());
 
     final pointData = await syncClient.getSyncPointData();
     expect(pointData.version, mockRepo.pointData.version);
@@ -222,7 +230,8 @@ void dotest() {
       await emptyServer.handle(req, req.requestedUri.path);
     });
     syncClient = SyncHttpClient(
-        url: 'http://${testServer.address.host}:${testServer.port}');
+        url: 'http://${testServer.address.host}:${testServer.port}',
+        client: HttpClient());
 
     final results = await syncClient.querySyncData(0, 10).toList();
     expect(results, isEmpty);
@@ -231,8 +240,9 @@ void dotest() {
 
   test('SyncHttpServer getSyncData returns null for missing record', () async {
     serveRequests();
-    syncClient =
-        SyncHttpClient(url: 'http://${server.address.host}:${server.port}');
+    syncClient = SyncHttpClient(
+        url: 'http://${server.address.host}:${server.port}',
+        client: HttpClient());
     final result =
         await syncClient.getSyncData(const DBRecord('test', 'missing'));
     expect(result, isNull);
@@ -257,7 +267,8 @@ void dotest() {
       await paginatedServer.handle(req, req.requestedUri.path);
     });
     syncClient = SyncHttpClient(
-        url: 'http://${testServer.address.host}:${testServer.port}');
+        url: 'http://${testServer.address.host}:${testServer.port}',
+        client: HttpClient());
 
     final page1 = await syncClient.querySyncData(0, 2).toList();
     final page2 = await syncClient.querySyncData(2, 2).toList();
