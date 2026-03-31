@@ -232,7 +232,10 @@ class SyncHttpClient extends SyncRepo {
 
   @override
   Future<void> push(SyncData meta, data) async {
-    await _request('/push', meta.toJson());
+    await _request('/push', {
+        'syncData': meta.toJson(),
+        'data': data,
+    });
   }
 
   @override
@@ -296,7 +299,7 @@ class SyncHttpServer {
       } else if (path == "/push") {
         final content = await utf8.decoder.bind(req).join();
         final data = jsonDecode(content) as Map<String, dynamic>;
-        final syncData = SyncData.fromJson(data);
+        final syncData = SyncData.fromJson(data['syncData']);
         await repo.push(syncData, data['data']);
         req.response
           ..statusCode = HttpStatus.ok
