@@ -83,8 +83,10 @@ class CrdtAdapterRepo extends SyncRepo {
       });
       return;
     }
+    final payload =
+        data is Map ? (Map<String, dynamic>.from(data)..remove('id')) : data;
     await adapter.db
-        .upsert(meta.entry, data); //TODO: Disable sync for this upsert
+        .upsert(meta.entry, payload); //TODO: Disable sync for this upsert
   }
 
   @override

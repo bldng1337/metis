@@ -18,9 +18,11 @@ class SyncData {
 
   SyncData.fromDB(Map<String, dynamic> db)
       : hlc = Hlc(db['timestamp'] as DateTime, db['count'] as int,
-            db["id"].toString()),
+            base64.encode(utf8.encode(json.encode((db["id"] as DBRecord).id)))),
         deleted = db['deleted'],
-        entry = db['entry'] as DBRecord;
+        entry = db['entry'] as DBRecord,
+        assert(db["id"] is DBRecord,
+            "Wrong id type in DB, expected DBRecord but got ${db["id"].runtimeType}");
 
   SyncData.fromJson(Map<String, dynamic> json)
       : hlc = Hlc.parse(json['hlc']),
@@ -32,7 +34,7 @@ class SyncData {
   Map<String, dynamic> toJson() => {
         'hlc': hlc.toString(),
         'deleted': deleted,
-        'entry': entry,
+        'entry': entry.toJson(),
       };
 
   Map<String, dynamic> toDB() => {
@@ -185,6 +187,7 @@ class VersionMismatchException implements Exception {
     return "VersionMismatchException: $what local: $local remote: $remote";
   }
 }
+
 class SyncHttpClient extends SyncRepo {
   final String url;
   final HttpClient client;
@@ -231,8 +234,8 @@ class SyncHttpClient extends SyncRepo {
   @override
   Future<void> push(SyncData meta, data) async {
     await _request('/push', {
-        'syncData': meta.toJson(),
-        'data': data,
+      'syncData': meta.toJson(),
+      'data': data,
     });
   }
 

@@ -7,6 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_surrealdb/flutter_surrealdb.dart';
 import 'package:metis/adapter/migration.dart';
 import 'package:metis/adapter/sync/repo.dart';
+import 'package:metis/metis.dart';
 
 class MockSyncRepo extends SyncRepo {
   final SyncRepoData pointData;
@@ -70,7 +71,60 @@ SyncRepoData _makeRepoData(int entries, int version) {
 }
 
 void main() {
+  setUpAll(() async => await SurrealDB.ensureInitialized());
   dotest();
+}
+
+Future<
+    ({
+      AdapterSurrealDB serverDb,
+      CrdtAdapter serverCrdt,
+      AdapterSurrealDB clientDb,
+      CrdtAdapter clientCrdt,
+      SyncHttpClient httpClient,
+      HttpServer server,
+      Future<void> Function() dispose,
+    })> _startRealDbHttpSync() async {
+  const tables = {
+    SyncTable(
+      table: DBTable('test'),
+      version: 1,
+      range: VersionRange.exact(1),
+    )
+  };
+
+  final serverDb = await AdapterSurrealDB.connect('mem://');
+  await serverDb.use(db: 'test', ns: 'test');
+  final serverCrdt = await serverDb.setCrdtAdapter(tablesToSync: tables);
+
+  final clientDb = await AdapterSurrealDB.connect('mem://');
+  await clientDb.use(db: 'test', ns: 'test');
+  final clientCrdt = await clientDb.setCrdtAdapter(tablesToSync: tables);
+
+  final httpServer = SyncHttpServer(port: 0, repo: serverCrdt.syncRepo);
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  server.listen((req) async {
+    await httpServer.handle(req, req.requestedUri.path);
+  });
+  final httpClient = SyncHttpClient(
+    url: 'http://${server.address.host}:${server.port}',
+    client: HttpClient(),
+  );
+
+  return (
+    serverDb: serverDb,
+    serverCrdt: serverCrdt,
+    clientDb: clientDb,
+    clientCrdt: clientCrdt,
+    httpClient: httpClient,
+    server: server,
+    dispose: () async {
+      httpClient.dispose();
+      await server.close(force: true);
+      serverDb.dispose();
+      clientDb.dispose();
+    },
+  );
 }
 
 void dotest() {
@@ -277,5 +331,50 @@ void dotest() {
     expect(page2.length, 2);
     expect(page3.length, 1);
     await testServer.close(force: true);
+  });
+
+  test('end-to-end sync over HTTP with real mem:// database', () async {
+    final stack = await _startRealDbHttpSync();
+    try {
+      // Server -> Client: insert on the server DB, sync over HTTP, then verify
+      // the record (and its CRDT metadata) arrived on the client DB.
+      const r1 = DBRecord('test', 'server1');
+      await stack.serverDb.upsert(r1, {'value': 'from-server'});
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      final pointData = await stack.httpClient.getSyncPointData();
+      expect(pointData.entries, 1);
+      expect(pointData.version, 1);
+
+      await stack.clientCrdt.sync(stack.httpClient);
+
+      final clientR1 = await stack.clientDb.select(r1);
+      expect(clientR1, isNotNull);
+      expect(clientR1['value'], 'from-server');
+
+      // Client -> Server: insert on the client DB, sync over HTTP, then verify
+      // the record made it back to the server DB.
+      const r2 = DBRecord('test', 'client1');
+      await stack.clientDb.upsert(r2, {'value': 'from-client'});
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      await stack.clientCrdt.sync(stack.httpClient);
+
+      final serverR2 = await stack.serverDb.select(r2);
+      expect(serverR2, isNotNull);
+      expect(serverR2['value'], 'from-client');
+
+      // Delete propagation: delete on the server, sync, then verify the record
+      // is removed from the client as well.
+      await stack.serverDb.delete(r1);
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      await stack.clientCrdt.sync(stack.httpClient);
+
+      final clientR1AfterDelete = await stack.clientDb.select(r1);
+      expect(clientR1AfterDelete, isNull);
+    } finally {
+      await stack.dispose();
+    }
   });
 }
