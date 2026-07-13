@@ -339,7 +339,8 @@ void dotest() {
       // Server -> Client: insert on the server DB, sync over HTTP, then verify
       // the record (and its CRDT metadata) arrived on the client DB.
       const r1 = DBRecord('test', 'server1');
-      await stack.serverDb.upsert(r1, {'value': 'from-server'});
+      await stack.serverDb
+          .upsert(r1, {'value': 'from-server', 'test-dbrecord': r1});
       await Future.delayed(const Duration(milliseconds: 100));
 
       final pointData = await stack.httpClient.getSyncPointData();
@@ -351,11 +352,17 @@ void dotest() {
       final clientR1 = await stack.clientDb.select(r1);
       expect(clientR1, isNotNull);
       expect(clientR1['value'], 'from-server');
+      expect(clientR1['test-dbrecord'],
+          isA<DBRecord>()); //DB Record Identity should be preserved in the client DB
+      expect(clientR1['test-dbrecord'], r1);
 
       // Client -> Server: insert on the client DB, sync over HTTP, then verify
       // the record made it back to the server DB.
       const r2 = DBRecord('test', 'client1');
-      await stack.clientDb.upsert(r2, {'value': 'from-client'});
+      await stack.clientDb.upsert(r2, {
+        'value': 'from-client',
+        'test-dbrecord': const DBRecord('test', 'some-other-record'),
+      });
       await Future.delayed(const Duration(milliseconds: 100));
 
       await stack.clientCrdt.sync(stack.httpClient);
@@ -363,6 +370,10 @@ void dotest() {
       final serverR2 = await stack.serverDb.select(r2);
       expect(serverR2, isNotNull);
       expect(serverR2['value'], 'from-client');
+      expect(serverR2['test-dbrecord'],
+          isA<DBRecord>()); //DB Record Identity should be preserved in the server DB
+      expect(serverR2['test-dbrecord'],
+          const DBRecord('test', 'some-other-record'));
 
       // Delete propagation: delete on the server, sync, then verify the record
       // is removed from the client as well.

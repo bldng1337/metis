@@ -201,7 +201,7 @@ class SyncHttpClient extends SyncRepo {
     Uri uri = Uri.parse(url + path);
     final request = await client.postUrl(uri);
     request.headers.contentType = ContentType.json;
-    request.write(jsonEncode(body));
+    request.write(jsonEncode(body, toEncodable: serializer));
     final response = await request.close();
     if (response.statusCode != HttpStatus.ok) {
       final error = await utf8.decoder.bind(response).join();
@@ -214,7 +214,7 @@ class SyncHttpClient extends SyncRepo {
   @override
   Future<SyncData?> getSyncData(DBRecord id) async {
     final content = await _request('/getSyncData', id.toJson());
-    final decoded = jsonDecode(content);
+    final decoded = jsonDecode(content, reviver: revive);
     if (decoded == null) return null;
     return SyncData.fromJson(decoded as Map<String, dynamic>);
   }
@@ -222,13 +222,13 @@ class SyncHttpClient extends SyncRepo {
   @override
   Future<SyncRepoData> getSyncPointData() async {
     final content = await _request('/getSyncPointData', {});
-    return SyncRepoData.fromJson(jsonDecode(content));
+    return SyncRepoData.fromJson(jsonDecode(content, reviver: revive));
   }
 
   @override
   Future<dynamic> pull(SyncData meta) async {
     final content = await _request('/pull', meta.toJson());
-    return jsonDecode(content);
+    return jsonDecode(content, reviver: revive);
   }
 
   @override
@@ -245,7 +245,7 @@ class SyncHttpClient extends SyncRepo {
       'offset': offset,
       'limit': limit,
     });
-    final list = jsonDecode(content) as List<dynamic>;
+    final list = jsonDecode(content, reviver: revive) as List<dynamic>;
     for (final e in list) {
       yield SyncData.fromJson(e as Map<String, dynamic>);
     }
@@ -254,6 +254,34 @@ class SyncHttpClient extends SyncRepo {
   void dispose() {
     client.close();
   }
+}
+
+Object? serializer(Object? obj) {
+  if (obj == null) {
+    return null;
+  }
+  if (obj is DBRecord) {
+    //TODO: preserve other surreal native types
+    return {...obj.toJson(), '__metis_crdt__': 'DBRecord'};
+  }
+  try {
+    return (obj as dynamic).toDBJson();
+  } on NoSuchMethodError {
+    // ignore: avoid_catching_errors
+  }
+  try {
+    return (obj as dynamic).toJson();
+  } on NoSuchMethodError {
+    // ignore: avoid_catching_errors
+  }
+  throw Exception("Object of type ${obj.runtimeType} is not JSON serializable");
+}
+
+Object? revive(Object? key, Object? obj) {
+  if (obj is Map<String, dynamic> && obj['__metis_crdt__'] == 'DBRecord') {
+    return DBRecord.fromJson(obj);
+  }
+  return obj;
 }
 
 class SyncHttpServer {
@@ -275,31 +303,34 @@ class SyncHttpServer {
     try {
       if (path == "/getSyncData") {
         final content = await utf8.decoder.bind(req).join();
-        final data = jsonDecode(content) as Map<String, dynamic>;
+        final data =
+            jsonDecode(content, reviver: revive) as Map<String, dynamic>;
         final syncData = DBRecord.fromJson(data);
         final res = await repo.getSyncData(syncData);
         req.response
           ..statusCode = HttpStatus.ok
-          ..write(jsonEncode(res?.toJson()))
+          ..write(jsonEncode(res?.toJson(), toEncodable: serializer))
           ..close();
       } else if (path == "/getSyncPointData") {
         final res = await repo.getSyncPointData();
         req.response
           ..statusCode = HttpStatus.ok
-          ..write(jsonEncode(res.toJson()))
+          ..write(jsonEncode(res.toJson(), toEncodable: serializer))
           ..close();
       } else if (path == "/pull") {
         final content = await utf8.decoder.bind(req).join();
-        final data = jsonDecode(content) as Map<String, dynamic>;
+        final data =
+            jsonDecode(content, reviver: revive) as Map<String, dynamic>;
         final syncData = SyncData.fromJson(data);
         final res = await repo.pull(syncData);
         req.response
           ..statusCode = HttpStatus.ok
-          ..write(jsonEncode(res))
+          ..write(jsonEncode(res, toEncodable: serializer))
           ..close();
       } else if (path == "/push") {
         final content = await utf8.decoder.bind(req).join();
-        final data = jsonDecode(content) as Map<String, dynamic>;
+        final data =
+            jsonDecode(content, reviver: revive) as Map<String, dynamic>;
         final syncData = SyncData.fromJson(data['syncData']);
         await repo.push(syncData, data['data']);
         req.response
@@ -308,13 +339,15 @@ class SyncHttpServer {
           ..close();
       } else if (path == "/querySyncData") {
         final content = await utf8.decoder.bind(req).join();
-        final data = jsonDecode(content) as Map<String, dynamic>;
+        final data =
+            jsonDecode(content, reviver: revive) as Map<String, dynamic>;
         final offset = data['offset'] as int? ?? 0;
         final limit = data['limit'] as int? ?? 50;
         final res = await repo.querySyncData(offset, limit).toList();
         req.response
           ..statusCode = HttpStatus.ok
-          ..write(jsonEncode(res.map((e) => e.toJson()).toList()))
+          ..write(jsonEncode(res.map((e) => e.toJson()).toList(),
+              toEncodable: serializer))
           ..close();
       } else {
         req.response
