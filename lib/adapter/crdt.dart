@@ -72,21 +72,21 @@ class CrdtAdapterRepo extends SyncRepo {
     if (!adapter.tablesToSync.any((e) => e.table.tb == meta.entry.tb)) {
       return;
     }
-    await adapter.db.upsert(
-      adapter._getSyncRecord(meta.entry),
-      meta.toDB(),
-    );
     if (data == null) {
       // We can't use the delete method here as the current version of surrealdb uses ONLY for the delete method that needs the record to exist which we cannot guarantee
       await adapter.db.query("DELETE FROM \$entry", vars: {
         "entry": meta.entry,
       });
-      return;
+    } else {
+      final payload =
+          data is Map ? (Map<String, dynamic>.from(data)..remove('id')) : data;
+      await adapter.db.upsert(meta.entry, payload);
     }
-    final payload =
-        data is Map ? (Map<String, dynamic>.from(data)..remove('id')) : data;
-    await adapter.db
-        .upsert(meta.entry, payload); //TODO: Disable sync for this upsert
+    // Write the CRDT meta after the data write. The data write refires the tables sync event, which would overwrite the meta with time::now() and a deleted flag derived from the event type, corrupting the authoritative HLC we are propagating
+    await adapter.db.upsert(
+      adapter._getSyncRecord(meta.entry),
+      meta.toDB(),
+    );
   }
 
   @override

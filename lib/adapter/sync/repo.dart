@@ -4,6 +4,11 @@ import 'dart:io';
 import 'package:crdt/crdt.dart';
 import 'package:flutter_surrealdb/flutter_surrealdb.dart';
 import 'package:metis/adapter/migration.dart';
+import 'package:uuid/uuid_value.dart';
+
+/// Tag used to mark SurrealDB native types in the JSON sync payload so the
+/// revive function can reconstruct them.
+const _metisCrdtTag = '__metis_crdt__';
 
 class SyncData {
   Hlc hlc;
@@ -261,9 +266,21 @@ Object? serializer(Object? obj) {
     return null;
   }
   if (obj is DBRecord) {
-    //TODO: preserve other surreal native types
-    return {...obj.toJson(), '__metis_crdt__': 'DBRecord'};
+    return {...obj.toJson(), _metisCrdtTag: 'DBRecord'};
   }
+  if (obj is DateTime) {
+    return {_metisCrdtTag: 'DateTime', 'value': obj.toUtc().toIso8601String()};
+  }
+  if (obj is Duration) {
+    return {_metisCrdtTag: 'Duration', 'value': obj.inMicroseconds};
+  }
+  if (obj is UuidValue) {
+    return {_metisCrdtTag: 'Uuid', 'value': obj.uuid};
+  }
+  if (obj is BigInt) {
+    return {_metisCrdtTag: 'BigInt', 'value': obj.toString()};
+  }
+  // NOTE: Uint8List is intentionally not tagged here. dart:converts jsonEncode already encodes a Uint8List as a JSON array (it never invokes toEncodable for it), so callers receive a List<int> on the other side. Consumers that need a Uint8List must convert it.
   try {
     return (obj as dynamic).toDBJson();
   } on NoSuchMethodError {
@@ -278,8 +295,19 @@ Object? serializer(Object? obj) {
 }
 
 Object? revive(Object? key, Object? obj) {
-  if (obj is Map<String, dynamic> && obj['__metis_crdt__'] == 'DBRecord') {
-    return DBRecord.fromJson(obj);
+  if (obj is Map<String, dynamic> && obj[_metisCrdtTag] is String) {
+    switch (obj[_metisCrdtTag]) {
+      case 'DBRecord':
+        return DBRecord.fromJson(obj);
+      case 'DateTime':
+        return DateTime.parse(obj['value'] as String);
+      case 'Duration':
+        return Duration(microseconds: obj['value'] as int);
+      case 'Uuid':
+        return UuidValue.fromString(obj['value'] as String);
+      case 'BigInt':
+        return BigInt.parse(obj['value'] as String);
+    }
   }
   return obj;
 }
