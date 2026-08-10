@@ -56,7 +56,7 @@ class AdapterSurrealDB implements SurrealDB {
 
   @override
   Stream<Notification> live(DBTable table, {bool? diff}) {
-    return _surreal.live(table);
+    return _surreal.live(table, diff: diff);
   }
 
   @override
@@ -107,6 +107,8 @@ class AdapterSurrealDB implements SurrealDB {
   void dispose() {
     disposeAdapters().then((_) {
       _surreal.dispose();
+    }).catchError((Object error, StackTrace stackTrace) {
+      Zone.current.handleUncaughtError(error, stackTrace);
     });
   }
 

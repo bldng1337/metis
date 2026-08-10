@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:crdt/crdt.dart';
 import 'package:flutter_surrealdb/flutter_surrealdb.dart';
 import 'package:metis/adapter.dart';
 import 'package:metis/adapter/migration.dart';
@@ -35,7 +34,7 @@ class CrdtAdapterRepo extends SyncRepo {
   Future<List<SyncData>> _querySyncData(int offset, int limit) async {
     final data = await adapter.db.query(
         """
-              RETURN SELECT * FROM type::table(\$table) LIMIT \$limit START \$offset*\$limit;
+              RETURN SELECT * FROM type::table(\$table) ORDER BY id LIMIT \$limit START \$offset;
               """
             .trim(),
         vars: {
@@ -113,6 +112,9 @@ class CrdtAdapter extends Adapter {
   final Set<SyncTable> tablesToSync;
   static const version = 1;
 
+  static bool _validIdentifier(String name) =>
+      RegExp(r'^[a-zA-Z0-9_]+$').hasMatch(name);
+
   CrdtAdapter({
     required super.db,
     required this.tablesToSync,
@@ -121,10 +123,14 @@ class CrdtAdapter extends Adapter {
   })  : assert(crdtTableName.isNotEmpty),
         assert(migrationTableName.isNotEmpty),
         assert(tablesToSync.isNotEmpty),
-        assert(crdtTableName.contains(" ") == false),
-        assert(migrationTableName.contains(" ") == false),
-        assert(RegExp(r'^[a-zA-Z0-9_]+$').hasMatch(crdtTableName)),
-        assert(RegExp(r'^[a-zA-Z0-9_]+$').hasMatch(migrationTableName));
+        assert(_validIdentifier(crdtTableName),
+            'crdtTableName must be a valid identifier'),
+        assert(_validIdentifier(migrationTableName),
+            'migrationTableName must be a valid identifier'),
+        assert(
+            tablesToSync.every((t) => _validIdentifier(t.table.tb)),
+            'Every synced table name must be a valid identifier '
+            '(alphanumeric and underscore only)');
 
   @override
   Future<void> init() async {
@@ -183,14 +189,10 @@ class CrdtAdapter extends Adapter {
   }
 
   Future<void> removeSyncTable(SyncTable table) async {
-    await db.query(
-        """
-      REMOVE EVENT IF EXISTS sync ON \$sync_table;
-      """
-            .trim(),
-        vars: {
-          "sync_table": table.table,
-        });
+    final name = table.table.tb;
+    assert(_validIdentifier(name),
+        'Synced table name must be a valid identifier');
+    await db.query('REMOVE EVENT IF EXISTS sync ON $name;');
   }
 
   DBRecord _getSyncRecord(DBRecord record) {

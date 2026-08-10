@@ -81,7 +81,11 @@ class MigrationAdapter extends Adapter {
     required this.onMigrate,
     required this.onCreate,
     this.migrationTableName = "_version",
-  });
+  }) : assert(_validIdentifier(migrationName),
+            'migrationName must be a valid identifier');
+
+  static bool _validIdentifier(String name) =>
+      RegExp(r'^[a-zA-Z0-9_]+$').hasMatch(name);
 
   @override
   Future<void> init() async {
@@ -90,12 +94,12 @@ class MigrationAdapter extends Adapter {
     final record = _getRecord();
     final versionmeta = await db.select(record);
     final currversion = versionmeta?["version"] as int?;
-    await db.upsert(record, {"version": version});
     if (currversion == null) {
       await onCreate(db);
     } else if (currversion != version) {
       await onMigrate(db, currversion, version);
     }
+    await db.upsert(record, {"version": version});
   }
 
   DBRecord _getRecord() => DBRecord(migrationTableName, migrationName);

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -21,13 +22,19 @@ class SyncData {
     required this.entry,
   });
 
-  SyncData.fromDB(Map<String, dynamic> db)
-      : hlc = Hlc(db['timestamp'] as DateTime, db['count'] as int,
-            base64.encode(utf8.encode(json.encode((db["id"] as DBRecord).id)))),
-        deleted = db['deleted'],
-        entry = db['entry'] as DBRecord,
-        assert(db["id"] is DBRecord,
-            "Wrong id type in DB, expected DBRecord but got ${db["id"].runtimeType}");
+  factory SyncData.fromDB(Map<String, dynamic> db) {
+    final id = db['id'];
+    if (id is! DBRecord) {
+      throw ArgumentError(
+          'Wrong id type in DB, expected DBRecord but got ${id.runtimeType}');
+    }
+    return SyncData(
+      hlc: Hlc(db['timestamp'] as DateTime, db['count'] as int,
+          base64.encode(utf8.encode(json.encode(id.id)))),
+      deleted: db['deleted'] as bool,
+      entry: db['entry'] as DBRecord,
+    );
+  }
 
   SyncData.fromJson(Map<String, dynamic> json)
       : hlc = Hlc.parse(json['hlc']),
@@ -50,7 +57,7 @@ class SyncData {
       };
 
   int compareTo(SyncData other) {
-    return other.hlc.compareTo(hlc);
+    return hlc.compareTo(other.hlc);
   }
 
   @override
@@ -166,13 +173,15 @@ abstract class SyncRepo {
           continue;
         }
         switch (localsync.compareTo(remotesync)) {
+          // local Hlc is older -> remote wins, push remote data to local.
           case -1:
-            await remote.push(localsync, await pull(localsync));
+            await push(remotesync, await remote.pull(remotesync));
             break;
           case 0:
             break;
+          // local Hlc is newer -> local wins, push local data to remote.
           case 1:
-            await push(remotesync, await remote.pull(remotesync));
+            await remote.push(localsync, await pull(localsync));
             break;
         }
       }
@@ -203,7 +212,7 @@ class SyncHttpClient extends SyncRepo {
   });
 
   Future<String> _request(String path, Object? body) async {
-    Uri uri = Uri.parse(url + path);
+    final uri = Uri.parse(url).resolve(path);
     final request = await client.postUrl(uri);
     request.headers.contentType = ContentType.json;
     request.write(jsonEncode(body, toEncodable: serializer));
@@ -314,11 +323,14 @@ Object? revive(Object? key, Object? obj) {
 
 class SyncHttpServer {
   final int port;
+  final InternetAddress address;
   final SyncRepo repo;
-  const SyncHttpServer({
+
+  SyncHttpServer({
     this.port = 9876,
+    InternetAddress? address,
     required this.repo,
-  });
+  }) : address = address ?? InternetAddress.loopbackIPv4;
 
   Future<void> handle(HttpRequest req, String path) async {
     if (req.headers.contentType?.mimeType != ContentType.json.mimeType) {
@@ -392,9 +404,13 @@ class SyncHttpServer {
   }
 
   Future<void> start() async {
-    final server = await HttpServer.bind(InternetAddress.anyIPv4, port);
-    await for (final req in server) {
-      await handle(req, req.requestedUri.path);
-    }
+    final server = await HttpServer.bind(address, port);
+    final done = Completer<void>();
+    server.listen(
+      (req) => handle(req, req.requestedUri.path),
+      onDone: done.complete,
+      onError: (Object e, StackTrace s) => done.completeError(e, s),
+    );
+    await done.future;
   }
 }
