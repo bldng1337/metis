@@ -17,16 +17,21 @@ class AdapterSurrealDB implements SurrealDB {
   }
 
   Future<T> setAdapter<T extends Adapter>(T adapter, {String? name}) async {
-    if (_adapters.containsKey((T, name ?? ""))) {
-      await _adapters[(T, name ?? "")]!.dispose();
-    }
+    final key = (T, name ?? "");
     await adapter.init();
-    _adapters[(T, name ?? "")] = adapter;
+    final old = _adapters[key];
+    _adapters[key] = adapter;
+    await old?.dispose();
     return adapter;
   }
 
   T getAdapter<T extends Adapter>({String? name}) {
-    return _adapters[(T, name ?? "")]! as T;
+    final adapter = _adapters[(T, name ?? "")];
+    if (adapter == null) {
+      throw StateError(
+          'Adapter $T (name: ${name ?? "default"}) is not registered');
+    }
+    return adapter as T;
   }
 
   @override
@@ -103,13 +108,16 @@ class AdapterSurrealDB implements SurrealDB {
     _adapters.clear();
   }
 
+  Future<void> disposeAsync() async {
+    await disposeAdapters();
+    _surreal.dispose();
+  }
+
   @override
   void dispose() {
-    disposeAdapters().then((_) {
-      _surreal.dispose();
-    }).catchError((Object error, StackTrace stackTrace) {
+    unawaited(disposeAsync().catchError((Object error, StackTrace stackTrace) {
       Zone.current.handleUncaughtError(error, stackTrace);
-    });
+    }));
   }
 
   SurrealDB get inner => _surreal;
