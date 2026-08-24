@@ -28,8 +28,7 @@ class DirectFuzzSync extends FuzzSyncStrategy {
   String get name => 'direct';
 
   @override
-  Future<void> sync(CrdtAdapter local, SyncRepo remote) =>
-      local.sync(remote);
+  Future<void> sync(CrdtAdapter local, SyncRepo remote) => local.sync(remote);
 }
 
 /// Synchronizes over real HTTP using [SyncHttpServer] / [SyncHttpClient],
@@ -41,7 +40,7 @@ class HttpFuzzSync extends FuzzSyncStrategy {
 
   @override
   Future<void> sync(CrdtAdapter local, SyncRepo remote) async {
-    final handler = SyncHttpServer(port: 0, repo: remote);
+    final handler = SyncHttpHandler(repo: remote);
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final sub = server.listen((req) async {
       await handler.handle(req, req.requestedUri.path);
@@ -161,8 +160,7 @@ Future<void> runFuzz(
     // no-op), so the tombstone timestamp would never advance. Issuing blind
     // deletes would therefore diverge from the LWW oracle for a reason that is
     // not a sync bug. Upserts after a delete still resurrect the record.
-    final liveOnEdge = List<Set<String>>.generate(
-        edgeCount, (_) => <String>{});
+    final liveOnEdge = List<Set<String>>.generate(edgeCount, (_) => <String>{});
 
     for (int step = 0; step < mutations; step++) {
       final edgeIndex = 1 + rng.nextInt(edgeCount); // edges are dbs[1..]
@@ -185,12 +183,12 @@ Future<void> runFuzz(
         opLog.add(_OpLogEntry(step, 'upsert', edgeIndex, id.id as String));
       }
 
-      // Determinism lever: space ops apart so each write to a given record gets
-      // a distinct, globally-ordered HLC timestamp. The CRDT derives its node
-      // id from the record id (not the DB), so two writes to the same record in
-      // the same millisecond on different DBs produce an exact HLC tie
-      // (compareTo==0) and sync skips them, breaking convergence. opDelayMs must
-      // exceed the timer granularity so consecutive ops land in distinct ms.
+      // Determinism lever: space ops apart so each write to a given record
+      // gets a distinct, globally-ordered HLC timestamp, which the oracle
+      // relies on (last step wins). The CRDT node id is per-replica since
+      // schema v2, so even exact timestamp ties between edges now resolve
+      // deterministically by node comparison instead of being skipped; the
+      // delay only keeps the oracle's "later step wins" reasoning exact.
       await Future.delayed(Duration(milliseconds: opDelayMs));
     }
 

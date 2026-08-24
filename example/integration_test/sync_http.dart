@@ -101,10 +101,10 @@ Future<
   await clientDb.use(db: 'test', ns: 'test');
   final clientCrdt = await clientDb.setCrdtAdapter(tablesToSync: tables);
 
-  final httpServer = SyncHttpServer(port: 0, repo: serverCrdt.syncRepo);
+  final httpHandler = SyncHttpHandler(repo: serverCrdt.syncRepo);
   final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
   server.listen((req) async {
-    await httpServer.handle(req, req.requestedUri.path);
+    await httpHandler.handle(req, req.requestedUri.path);
   });
   final httpClient = SyncHttpClient(
     url: 'http://${server.address.host}:${server.port}',
@@ -129,7 +129,7 @@ Future<
 
 void dotest() {
   late HttpServer server;
-  late SyncHttpServer syncServer;
+  late SyncHttpHandler syncHandler;
   late SyncHttpClient syncClient;
   late MockSyncRepo mockRepo;
 
@@ -146,7 +146,7 @@ void dotest() {
         testRecord: {'field': 'value'},
       },
     );
-    syncServer = SyncHttpServer(port: 0, repo: mockRepo);
+    syncHandler = SyncHttpHandler(repo: mockRepo);
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
   });
 
@@ -155,9 +155,24 @@ void dotest() {
     syncClient.dispose();
   });
 
+  /// Serves requests through the handler, mapping its thrown errors to
+  /// responses the way [SyncHttpServer.start] does (and the way an embedder
+  /// plugging the handler into their own server would).
   void serveRequests() {
     server.listen((req) async {
-      await syncServer.handle(req, req.requestedUri.path);
+      try {
+        await syncHandler.handle(req, req.requestedUri.path);
+      } on SyncHttpException catch (e) {
+        req.response
+          ..statusCode = e.statusCode
+          ..write(jsonEncode({'error': e.message}))
+          ..close();
+      } catch (e) {
+        req.response
+          ..statusCode = HttpStatus.internalServerError
+          ..write('{"error":"Internal server error"}')
+          ..close();
+      }
     });
   }
 
@@ -278,10 +293,10 @@ void dotest() {
       data: {},
       pullData: {},
     );
-    final emptyServer = SyncHttpServer(port: 0, repo: emptyRepo);
+    final emptyHandler = SyncHttpHandler(repo: emptyRepo);
     final testServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     testServer.listen((req) async {
-      await emptyServer.handle(req, req.requestedUri.path);
+      await emptyHandler.handle(req, req.requestedUri.path);
     });
     syncClient = SyncHttpClient(
         url: 'http://${testServer.address.host}:${testServer.port}',
@@ -315,10 +330,10 @@ void dotest() {
       data: manyData,
       pullData: manyPull,
     );
-    final paginatedServer = SyncHttpServer(port: 0, repo: paginatedRepo);
+    final paginatedHandler = SyncHttpHandler(repo: paginatedRepo);
     final testServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     testServer.listen((req) async {
-      await paginatedServer.handle(req, req.requestedUri.path);
+      await paginatedHandler.handle(req, req.requestedUri.path);
     });
     syncClient = SyncHttpClient(
         url: 'http://${testServer.address.host}:${testServer.port}',

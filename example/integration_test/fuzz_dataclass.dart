@@ -167,22 +167,19 @@ class FuzzRecord {
           ? null
           : Uint8List.fromList((row['bytesField'] as List).cast<int>()),
       listField: List<dynamic>.from(row['listField'] as List? ?? const []),
-      mapField:
-          Map<String, dynamic>.from(row['mapField'] as Map? ?? const {}),
+      mapField: Map<String, dynamic>.from(row['mapField'] as Map? ?? const {}),
       relationField: relation is DBRecord ? relation : null,
     );
   }
 
   @override
   bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is FuzzRecord && _normalizedEquals(other);
+      identical(this, other) || other is FuzzRecord && _normalizedEquals(other);
 
   bool _normalizedEquals(FuzzRecord other) {
     if (boolField != other.boolField) return false;
     if (intField != other.intField) return false;
-    if ((_normalDouble(doubleField) - _normalDouble(other.doubleField))
-            .abs() >
+    if ((_normalDouble(doubleField) - _normalDouble(other.doubleField)).abs() >
         1e-9) {
       return false;
     }

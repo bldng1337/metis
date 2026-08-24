@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:metis/adapter/sync/repo.dart';
 import 'package:metis/metis.dart';
+import 'package:uuid/uuid.dart';
 
 void main() {
   setUpAll(() async => await SurrealDB.ensureInitialized());
@@ -103,5 +104,60 @@ void dotest() {
     final data2a = await db2.select(id);
     expect(data1a, isNull);
     expect(data2a, isNull);
+  });
+
+  test('migrates crdt schema v1 to v2 (node backfill + event redefinition)',
+      () async {
+    const tables = {
+      SyncTable(
+        table: DBTable('test'),
+        version: 1,
+        range: VersionRange.exact(1),
+      )
+    };
+    final db = await AdapterSurrealDB.connect("mem://");
+    await db.use(db: 'test', ns: 'test');
+    // Simulate a database written by schema v1: crdt table without the node
+    // field, version record at 1, one data record with its v1 crdt row, and
+    // the old event definition (no node, no OVERWRITE).
+    await db.query("""
+        DEFINE TABLE _version SCHEMALESS;
+        DEFINE TABLE crdt SCHEMAFULL;
+        DEFINE FIELD timestamp ON TABLE crdt TYPE datetime;
+        DEFINE FIELD count ON TABLE crdt TYPE int;
+        DEFINE FIELD deleted ON TABLE crdt TYPE bool;
+        DEFINE FIELD entry ON TABLE crdt TYPE record;
+        UPSERT _version:crdtcrdt SET version = 1;
+        DEFINE EVENT sync ON test THEN {
+          UPSERT type::record("crdt",[record::tb(\$value.id),record::id(\$value.id)]) SET timestamp=time::now(), count=0, deleted=\$event == "DELETE", entry=\$value.id;
+        };
+        """);
+    const id = DBRecord('test', 'old');
+    await db.upsert(id, {'v': 1});
+    await db.upsert(const DBRecord('crdt', ['test', 'old']), {
+      'timestamp': DateTime.utc(2024, 1, 1),
+      'count': 0,
+      'deleted': false,
+      'entry': id,
+    });
+
+    final crdt = await db.setCrdtAdapter(tablesToSync: tables);
+
+    // The migration added the field and backfilled the local node id.
+    final rows = (await db.query('SELECT * FROM crdt'))[0] as List<dynamic>;
+    expect(rows, isNotEmpty);
+    for (final row in rows.cast<Map<String, dynamic>>()) {
+      expect(row['node'], isA<String>());
+      expect(Uuid.isValidUUID(fromString: row['node'] as String), isTrue,
+          reason: 'v1 rows must be backfilled with a valid node id');
+    }
+
+    // The OVERWRITE-redefined event stamps the replica node on new writes.
+    const id2 = DBRecord('test', 'new');
+    await db.upsert(id2, {'v': 2});
+    await Future.delayed(const Duration(milliseconds: 100));
+    final meta = await crdt.syncRepo.getSyncData(id2);
+    expect(meta, isNotNull);
+    expect(meta!.hlc.nodeId, crdt.nodeId);
   });
 }
