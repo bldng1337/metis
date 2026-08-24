@@ -5,6 +5,8 @@ import 'package:metis/adapter.dart';
 import 'package:metis/adapter/migration.dart';
 import 'package:metis/adapter/sync/repo.dart';
 import 'package:metis/client.dart';
+import 'package:metis/store.dart';
+import 'package:uuid/uuid.dart';
 
 extension AdapterCrdtExt on AdapterSurrealDB {
   Future<CrdtAdapter> setCrdtAdapter({
@@ -71,21 +73,39 @@ class CrdtAdapterRepo extends SyncRepo {
     if (!adapter.tablesToSync.any((e) => e.table.tb == meta.entry.tb)) {
       return;
     }
+    final payload =
+        data is Map ? (Map<String, dynamic>.from(data)..remove('id')) : data;
     if (data == null) {
-      // We can't use the delete method here as the current version of surrealdb uses ONLY for the delete method that needs the record to exist which we cannot guarantee
-      await adapter.db.query("DELETE FROM \$entry", vars: {
-        "entry": meta.entry,
-      });
+      // Raw DELETE is used instead of the delete method because the delete method requires the record to exist, which we cannot guarantee.
+      await adapter.db.query(
+          """
+      BEGIN TRANSACTION;
+      DELETE FROM \$entry;
+      UPSERT \$meta CONTENT \$crdt;
+      COMMIT TRANSACTION;
+      """
+              .trim(),
+          vars: {
+            "entry": meta.entry,
+            "meta": adapter._getSyncRecord(meta.entry),
+            "crdt": meta.toDB(),
+          });
     } else {
-      final payload =
-          data is Map ? (Map<String, dynamic>.from(data)..remove('id')) : data;
-      await adapter.db.upsert(meta.entry, payload);
+      await adapter.db.query(
+          """
+      BEGIN TRANSACTION;
+      UPSERT \$entry CONTENT \$data;
+      UPSERT \$meta CONTENT \$crdt;
+      COMMIT TRANSACTION;
+      """
+              .trim(),
+          vars: {
+            "entry": meta.entry,
+            "meta": adapter._getSyncRecord(meta.entry),
+            "crdt": meta.toDB(),
+            "data": payload,
+          });
     }
-    // Write the CRDT meta after the data write. The data write refires the tables sync event, which would overwrite the meta with time::now() and a deleted flag derived from the event type, corrupting the authoritative HLC we are propagating
-    await adapter.db.upsert(
-      adapter._getSyncRecord(meta.entry),
-      meta.toDB(),
-    );
   }
 
   @override
@@ -110,30 +130,75 @@ class CrdtAdapter extends Adapter {
 
   /// The tables that should be synced.
   final Set<SyncTable> tablesToSync;
-  static const version = 1;
+  static const version = 2;
 
   static bool _validIdentifier(String name) =>
       RegExp(r'^[a-zA-Z0-9_]+$').hasMatch(name);
+
+  static void _checkIdentifier(String name, String what) {
+    if (!_validIdentifier(name)) {
+      throw ArgumentError.value(name, what,
+          'must be a valid identifier (alphanumeric and underscore only)');
+    }
+  }
 
   CrdtAdapter({
     required super.db,
     required this.tablesToSync,
     this.crdtTableName = "crdt",
     this.migrationTableName = "_version",
-  })  : assert(crdtTableName.isNotEmpty),
-        assert(migrationTableName.isNotEmpty),
-        assert(tablesToSync.isNotEmpty),
-        assert(_validIdentifier(crdtTableName),
-            'crdtTableName must be a valid identifier'),
-        assert(_validIdentifier(migrationTableName),
-            'migrationTableName must be a valid identifier'),
-        assert(
-            tablesToSync.every((t) => _validIdentifier(t.table.tb)),
-            'Every synced table name must be a valid identifier '
-            '(alphanumeric and underscore only)');
+  }) {
+    if (crdtTableName.isEmpty) {
+      throw ArgumentError.value(
+          crdtTableName, 'crdtTableName', 'must not be empty');
+    }
+    if (migrationTableName.isEmpty) {
+      throw ArgumentError.value(
+          migrationTableName, 'migrationTableName', 'must not be empty');
+    }
+    if (tablesToSync.isEmpty) {
+      throw ArgumentError.value(
+          tablesToSync, 'tablesToSync', 'must not be empty');
+    }
+    _checkIdentifier(crdtTableName, 'crdtTableName');
+    _checkIdentifier(migrationTableName, 'migrationTableName');
+    for (final t in tablesToSync) {
+      _checkIdentifier(t.table.tb, 'synced table name');
+    }
+  }
+
+  String? _nodeId;
+
+  String get nodeId {
+    final node = _nodeId;
+    if (node == null) {
+      throw StateError('nodeId accessed before init()');
+    }
+    return node;
+  }
+
+  Future<String> _ensureNodeId() async {
+    final store = KeyValueStore(db, migrationTableName);
+    const key = 'crdt_node';
+    String? node;
+    try {
+      node = await store.get(key) as String?;
+    } catch (_) {
+      // Selecting from a table that does not exist yet errors instead of returning null. The set below creates it implicitly.
+    }
+    if (node == null) {
+      node = const Uuid().v4();
+      await store.set(key, node);
+    }
+    if (!Uuid.isValidUUID(fromString: node)) {
+      throw StateError('Stored CRDT node id is not a valid UUID: $node');
+    }
+    return node;
+  }
 
   @override
   Future<void> init() async {
+    _nodeId = await _ensureNodeId();
     final migration = MigrationAdapter(
       db: db,
       version: version,
@@ -155,11 +220,22 @@ class CrdtAdapter extends Adapter {
         DEFINE FIELD count ON TABLE $crdtTableName TYPE int COMMENT 'The count of the HLC';
         DEFINE FIELD deleted ON TABLE $crdtTableName TYPE bool COMMENT 'If the record was deleted';
         DEFINE FIELD entry ON TABLE $crdtTableName TYPE record COMMENT 'The record that was modified';
+        DEFINE FIELD node ON TABLE $crdtTableName TYPE string COMMENT 'The node id of the replica that last wrote the record';
         """
         .trim());
   }
 
-  Future<void> onMigrate(SurrealDB db, int from, int to) async {}
+  Future<void> onMigrate(SurrealDB db, int from, int to) async {
+    if (from < 2) {
+      // v1 rows have no node id.
+      await db.query(
+          'DEFINE FIELD IF NOT EXISTS node ON TABLE $crdtTableName TYPE string;');
+      await db.query('UPDATE type::table(\$table) SET node = \$node;', vars: {
+        "table": crdtTableName,
+        "node": nodeId,
+      });
+    }
+  }
 
   @override
   Future<void> dispose() async {}
@@ -168,20 +244,20 @@ class CrdtAdapter extends Adapter {
     for (final table in tablesToSync) {
       //TODO: This is a possible injection point but as far as I can tell its not possible to use the vars for a define statement 2.0
       await db.query("""
-          DEFINE EVENT IF NOT EXISTS sync ON ${table.table.tb} THEN {
+          DEFINE EVENT OVERWRITE sync ON ${table.table.tb} THEN {
           let \$entry = type::record("$crdtTableName",[record::tb(\$value.id),record::id(\$value.id)]);
           let \$now = time::now();
           let \$deleted = \$event == "DELETE";
           let \$curr = SELECT * from ONLY \$entry;
           IF \$curr==null {
-              UPSERT \$entry SET timestamp=\$now, count=0, deleted=\$deleted, entry=\$value.id;
+              UPSERT \$entry SET timestamp=\$now, count=0, deleted=\$deleted, entry=\$value.id, node='$nodeId';
               RETURN NULL;
           };
           IF \$now <= \$curr.timestamp {
-              UPSERT \$entry SET timestamp=\$curr.timestamp, count=\$curr.count+1, deleted=\$deleted, entry=\$value.id;
+              UPSERT \$entry SET timestamp=\$curr.timestamp, count=\$curr.count+1, deleted=\$deleted, entry=\$value.id, node='$nodeId';
               RETURN NULL;
           };
-          UPSERT \$entry SET timestamp=\$now, count=0, deleted=\$deleted, entry=\$value.id;
+          UPSERT \$entry SET timestamp=\$now, count=0, deleted=\$deleted, entry=\$value.id, node='$nodeId';
           RETURN NULL;
           };
         """);
@@ -190,8 +266,7 @@ class CrdtAdapter extends Adapter {
 
   Future<void> removeSyncTable(SyncTable table) async {
     final name = table.table.tb;
-    assert(_validIdentifier(name),
-        'Synced table name must be a valid identifier');
+    _checkIdentifier(name, 'synced table name');
     await db.query('REMOVE EVENT IF EXISTS sync ON $name;');
   }
 

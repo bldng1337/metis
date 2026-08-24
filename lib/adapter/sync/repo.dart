@@ -29,8 +29,13 @@ class SyncData {
           'Wrong id type in DB, expected DBRecord but got ${id.runtimeType}');
     }
     return SyncData(
-      hlc: Hlc(db['timestamp'] as DateTime, db['count'] as int,
-          base64.encode(utf8.encode(json.encode(id.id)))),
+      hlc: Hlc(
+          db['timestamp'] as DateTime,
+          db['count'] as int,
+          // Rows written before the node field existed keep their old
+          // deterministic node so HLCs written by them still compare.
+          (db['node'] as String?) ??
+              base64.encode(utf8.encode(json.encode(id.id)))),
       deleted: db['deleted'] as bool,
       entry: db['entry'] as DBRecord,
     );
@@ -54,6 +59,7 @@ class SyncData {
         'count': hlc.counter,
         'deleted': deleted,
         'entry': entry,
+        'node': hlc.nodeId,
       };
 
   int compareTo(SyncData other) {
@@ -90,7 +96,7 @@ class SyncTable {
         'range': range.toJson(),
       };
   bool match(SyncTable other) =>
-      table == other.table &&
+      table.tb == other.table.tb &&
       range.match(other.version) &&
       other.range.match(version);
 }
@@ -119,6 +125,16 @@ class SyncRepoData {
       };
 }
 
+class TableMismatchException implements Exception {
+  final String what;
+  final DBTable table;
+
+  const TableMismatchException(this.what, this.table);
+
+  @override
+  String toString() => "TableMismatchException: $what (${table.resource})";
+}
+
 abstract class SyncRepo {
   Future<SyncRepoData> getSyncPointData();
 
@@ -140,9 +156,14 @@ abstract class SyncRepo {
           localdata.version, remotedata.version);
     }
     for (final table in localdata.tables) {
-      final repotable =
-          remotedata.tables.where((e) => e.table == table.table).firstOrNull;
-      if (repotable == null) continue;
+      final repotable = remotedata.tables
+          .where((e) => e.table.tb == table.table.tb)
+          .firstOrNull;
+      if (repotable == null) {
+        throw TableMismatchException(
+            'Table is synced locally but missing on the remote repo',
+            table.table);
+      }
       if (!table.match(repotable)) {
         throw VersionMismatchException(
             "Version mismatch with Repo on table ${table.table.resource}",
@@ -151,10 +172,12 @@ abstract class SyncRepo {
       }
     }
     await _syncdata(remote, remotedata.entries,
+        syncTables: localdata.tables.map((e) => e.table.tb).toSet(),
         chunkSize: chunkSize,
         onProgress: (progress, total) =>
             onProgress?.call(progress, remotedata.entries + localdata.entries));
     await remote._syncdata(this, localdata.entries,
+        syncTables: remotedata.tables.map((e) => e.table.tb).toSet(),
         chunkSize: chunkSize,
         onProgress: (progress, total) => onProgress?.call(
             progress + remotedata.entries,
@@ -162,11 +185,20 @@ abstract class SyncRepo {
   }
 
   Future<void> _syncdata(SyncRepo remote, int length,
-      {int chunkSize = 50,
+      {Set<String>? syncTables,
+      int chunkSize = 50,
       void Function(int progress, int total)? onProgress}) async {
-    for (int offset = 0; offset < length; offset += chunkSize) {
+    final deferred = <(SyncData, dynamic)>[];
+    int offset = 0;
+    while (true) {
       onProgress?.call(offset, length);
-      await for (final remotesync in remote.querySyncData(offset, chunkSize)) {
+      final page = await remote.querySyncData(offset, chunkSize).toList();
+      if (page.isEmpty) break;
+      offset += page.length;
+      for (final remotesync in page) {
+        if (syncTables != null && !syncTables.contains(remotesync.entry.tb)) {
+          continue;
+        }
         final localsync = await getSyncData(remotesync.entry);
         if (localsync == null) {
           await push(remotesync, await remote.pull(remotesync));
@@ -181,10 +213,13 @@ abstract class SyncRepo {
             break;
           // local Hlc is newer -> local wins, push local data to remote.
           case 1:
-            await remote.push(localsync, await pull(localsync));
+            deferred.add((localsync, await pull(localsync)));
             break;
         }
       }
+    }
+    for (final (meta, data) in deferred) {
+      await remote.push(meta, data);
     }
   }
 }
@@ -202,6 +237,11 @@ class VersionMismatchException implements Exception {
   }
 }
 
+Uri syncUri(String url, String path) {
+  final base = url.endsWith('/') ? url : '$url/';
+  return Uri.parse(base).resolve(path.replaceFirst(RegExp(r'^/+'), ''));
+}
+
 class SyncHttpClient extends SyncRepo {
   final String url;
   final HttpClient client;
@@ -212,7 +252,7 @@ class SyncHttpClient extends SyncRepo {
   });
 
   Future<String> _request(String path, Object? body) async {
-    final uri = Uri.parse(url).resolve(path);
+    final uri = syncUri(url, path);
     final request = await client.postUrl(uri);
     request.headers.contentType = ContentType.json;
     request.write(jsonEncode(body, toEncodable: serializer));
@@ -321,85 +361,105 @@ Object? revive(Object? key, Object? obj) {
   return obj;
 }
 
+class SyncHttpException implements Exception {
+  final int statusCode;
+  final String message;
+
+  const SyncHttpException(this.statusCode, this.message);
+
+  @override
+  String toString() => 'SyncHttpException($statusCode): $message';
+}
+
+class SyncHttpHandler {
+  final SyncRepo repo;
+
+  SyncHttpHandler({
+    required this.repo,
+  });
+
+  Future<void> handle(HttpRequest req, String path) async {
+    if (req.headers.contentType?.mimeType != ContentType.json.mimeType) {
+      throw const SyncHttpException(
+          HttpStatus.badRequest, 'Content-Type must be application/json');
+    }
+    if (path == "/getSyncData") {
+      final content = await utf8.decoder.bind(req).join();
+      final data = jsonDecode(content, reviver: revive) as Map<String, dynamic>;
+      final syncData = DBRecord.fromJson(data);
+      final res = await repo.getSyncData(syncData);
+      req.response
+        ..statusCode = HttpStatus.ok
+        ..write(jsonEncode(res?.toJson(), toEncodable: serializer))
+        ..close();
+    } else if (path == "/getSyncPointData") {
+      final res = await repo.getSyncPointData();
+      req.response
+        ..statusCode = HttpStatus.ok
+        ..write(jsonEncode(res.toJson(), toEncodable: serializer))
+        ..close();
+    } else if (path == "/pull") {
+      final content = await utf8.decoder.bind(req).join();
+      final data = jsonDecode(content, reviver: revive) as Map<String, dynamic>;
+      final syncData = SyncData.fromJson(data);
+      final res = await repo.pull(syncData);
+      req.response
+        ..statusCode = HttpStatus.ok
+        ..write(jsonEncode(res, toEncodable: serializer))
+        ..close();
+    } else if (path == "/push") {
+      final content = await utf8.decoder.bind(req).join();
+      final data = jsonDecode(content, reviver: revive) as Map<String, dynamic>;
+      final syncData = SyncData.fromJson(data['syncData']);
+      await repo.push(syncData, data['data']);
+      req.response
+        ..statusCode = HttpStatus.ok
+        ..write(jsonEncode({'status': 'ok'}))
+        ..close();
+    } else if (path == "/querySyncData") {
+      final content = await utf8.decoder.bind(req).join();
+      final data = jsonDecode(content, reviver: revive) as Map<String, dynamic>;
+      final offset = data['offset'] as int? ?? 0;
+      final limit = data['limit'] as int? ?? 50;
+      final res = await repo.querySyncData(offset, limit).toList();
+      req.response
+        ..statusCode = HttpStatus.ok
+        ..write(jsonEncode(res.map((e) => e.toJson()).toList(),
+            toEncodable: serializer))
+        ..close();
+    } else {
+      throw const SyncHttpException(HttpStatus.notFound, 'Not found');
+    }
+  }
+}
+
 class SyncHttpServer {
   final int port;
   final InternetAddress address;
   final SyncRepo repo;
+  final SyncHttpHandler handler;
 
   SyncHttpServer({
     this.port = 9876,
     InternetAddress? address,
     required this.repo,
-  }) : address = address ?? InternetAddress.loopbackIPv4;
+  })  : address = address ?? InternetAddress.loopbackIPv4,
+        handler = SyncHttpHandler(repo: repo);
 
-  Future<void> handle(HttpRequest req, String path) async {
-    if (req.headers.contentType?.mimeType != ContentType.json.mimeType) {
-      req.response
-        ..statusCode = HttpStatus.badRequest
-        ..write('{"error":"Content-Type must be application/json"}')
-        ..close();
-      return;
-    }
+  Future<void> _serve(HttpRequest req) async {
     try {
-      if (path == "/getSyncData") {
-        final content = await utf8.decoder.bind(req).join();
-        final data =
-            jsonDecode(content, reviver: revive) as Map<String, dynamic>;
-        final syncData = DBRecord.fromJson(data);
-        final res = await repo.getSyncData(syncData);
-        req.response
-          ..statusCode = HttpStatus.ok
-          ..write(jsonEncode(res?.toJson(), toEncodable: serializer))
-          ..close();
-      } else if (path == "/getSyncPointData") {
-        final res = await repo.getSyncPointData();
-        req.response
-          ..statusCode = HttpStatus.ok
-          ..write(jsonEncode(res.toJson(), toEncodable: serializer))
-          ..close();
-      } else if (path == "/pull") {
-        final content = await utf8.decoder.bind(req).join();
-        final data =
-            jsonDecode(content, reviver: revive) as Map<String, dynamic>;
-        final syncData = SyncData.fromJson(data);
-        final res = await repo.pull(syncData);
-        req.response
-          ..statusCode = HttpStatus.ok
-          ..write(jsonEncode(res, toEncodable: serializer))
-          ..close();
-      } else if (path == "/push") {
-        final content = await utf8.decoder.bind(req).join();
-        final data =
-            jsonDecode(content, reviver: revive) as Map<String, dynamic>;
-        final syncData = SyncData.fromJson(data['syncData']);
-        await repo.push(syncData, data['data']);
-        req.response
-          ..statusCode = HttpStatus.ok
-          ..write(jsonEncode({'status': 'ok'}))
-          ..close();
-      } else if (path == "/querySyncData") {
-        final content = await utf8.decoder.bind(req).join();
-        final data =
-            jsonDecode(content, reviver: revive) as Map<String, dynamic>;
-        final offset = data['offset'] as int? ?? 0;
-        final limit = data['limit'] as int? ?? 50;
-        final res = await repo.querySyncData(offset, limit).toList();
-        req.response
-          ..statusCode = HttpStatus.ok
-          ..write(jsonEncode(res.map((e) => e.toJson()).toList(),
-              toEncodable: serializer))
-          ..close();
-      } else {
-        req.response
-          ..statusCode = HttpStatus.notFound
-          ..write('{"error":"Not found"}')
-          ..close();
-      }
-    } catch (e) {
+      await handler.handle(req, req.requestedUri.path);
+    } on SyncHttpException catch (e) {
+      req.response
+        ..statusCode = e.statusCode
+        ..write(jsonEncode({'error': e.message}))
+        ..close();
+    } catch (e, s) {
       req.response
         ..statusCode = HttpStatus.internalServerError
-        ..write(jsonEncode({'error': e.toString()}))
+        ..write('{"error":"Internal server error"}')
         ..close();
+      Zone.current.handleUncaughtError(e, s);
     }
   }
 
@@ -407,7 +467,7 @@ class SyncHttpServer {
     final server = await HttpServer.bind(address, port);
     final done = Completer<void>();
     server.listen(
-      (req) => handle(req, req.requestedUri.path),
+      (req) => _serve(req),
       onDone: done.complete,
       onError: (Object e, StackTrace s) => done.completeError(e, s),
     );
