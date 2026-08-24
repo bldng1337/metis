@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter_surrealdb/flutter_surrealdb.dart';
 import 'package:metis/adapter.dart';
@@ -40,6 +41,11 @@ class AdapterSurrealDB implements SurrealDB {
   }
 
   @override
+  Stream<Uint8List> exportStream({Config? options}) {
+    return _surreal.exportStream(options: options);
+  }
+
+  @override
   Future<void> import({required String data}) async {
     return _surreal.import(data: data);
   }
@@ -60,13 +66,36 @@ class AdapterSurrealDB implements SurrealDB {
   }
 
   @override
-  Stream<Notification> live(DBTable table, {bool? diff}) {
-    return _surreal.live(table, diff: diff);
+  Stream<Notification> live(DBTable table, {bool? diff, UuidValue? session}) {
+    return _surreal.live(table, diff: diff, session: session);
   }
 
   @override
   Future<List<dynamic>> insert(DBTable thing, dynamic data) async {
     return _surreal.insert(thing, data);
+  }
+
+  @override
+  Future<dynamic> insertRelation(DBTable table, dynamic data) async {
+    return _surreal.insertRelation(table, data);
+  }
+
+  @override
+  Future<dynamic> merge(Resource thing, dynamic data) {
+    return _surreal.merge(thing, data);
+  }
+
+  @override
+  Future<dynamic> patch(Resource thing, List<Map<String, dynamic>> patches,
+      {bool? diff}) {
+    return _surreal.patch(thing, patches, diff: diff);
+  }
+
+  @override
+  Future<dynamic> relate(
+      Resource inRecord, String relation, Resource outRecord,
+      {dynamic data}) {
+    return _surreal.relate(inRecord, relation, outRecord, data: data);
   }
 
   @override
@@ -108,16 +137,10 @@ class AdapterSurrealDB implements SurrealDB {
     _adapters.clear();
   }
 
-  Future<void> disposeAsync() async {
-    await disposeAdapters();
-    _surreal.dispose();
-  }
-
   @override
-  void dispose() {
-    unawaited(disposeAsync().catchError((Object error, StackTrace stackTrace) {
-      Zone.current.handleUncaughtError(error, stackTrace);
-    }));
+  Future<void> dispose() async {
+    await disposeAdapters();
+    await _surreal.dispose();
   }
 
   SurrealDB get inner => _surreal;
@@ -133,8 +156,8 @@ class AdapterSurrealDB implements SurrealDB {
   }
 
   @override
-  Future<void> kill(UuidValue id) {
-    return _surreal.kill(id);
+  Future<void> kill(UuidValue id, {UuidValue? session}) {
+    return _surreal.kill(id, session: session);
   }
 
   @override
@@ -142,9 +165,12 @@ class AdapterSurrealDB implements SurrealDB {
     UuidValue id, {
     Future<void> Function()? onKill,
     bool shouldKillOnCancel = true,
+    UuidValue? session,
   }) {
     return _surreal.liveOf(id,
-        onKill: onKill, shouldKillOnCancel: shouldKillOnCancel);
+        onKill: onKill,
+        shouldKillOnCancel: shouldKillOnCancel,
+        session: session);
   }
 
   @override
@@ -174,7 +200,7 @@ class AdapterSurrealDB implements SurrealDB {
       String? username,
       String? password,
       String? access,
-      required variables}) {
+      Map<String, dynamic>? variables}) {
     return _surreal.signin(
         ns: ns,
         db: db,
@@ -189,7 +215,7 @@ class AdapterSurrealDB implements SurrealDB {
       {required String ns,
       required String db,
       required String access,
-      required variables}) {
+      Map<String, dynamic>? variables}) {
     return _surreal.signup(
         ns: ns, db: db, access: access, variables: variables);
   }
