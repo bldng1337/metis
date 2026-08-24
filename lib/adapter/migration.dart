@@ -42,13 +42,18 @@ class VersionRange {
   const VersionRange.upto(this.to) : from = 1;
   const VersionRange.exact(this.from) : to = from;
 
+  static int _asInt(Object? value, String what) {
+    if (value is! int) {
+      throw ArgumentError.value(value, what, 'must be an int');
+    }
+    return value;
+  }
+
   VersionRange.fromJson(Map<String, dynamic> json)
-      : from = json['from'],
-        to = json['to'],
-        assert(json['from'] is int),
-        assert(json['to'] is int),
-        assert(json['from'] <= json['to'],
-            'from must be less than or equal to to');
+      : this(
+          from: _asInt(json['from'], 'from'),
+          to: _asInt(json['to'], 'to'),
+        );
 
   Map<String, dynamic> toJson() => {
         'from': from,
@@ -81,8 +86,16 @@ class MigrationAdapter extends Adapter {
     required this.onMigrate,
     required this.onCreate,
     this.migrationTableName = "_version",
-  }) : assert(_validIdentifier(migrationName),
-            'migrationName must be a valid identifier');
+  }) {
+    if (!MigrationAdapter._validIdentifier(migrationName)) {
+      throw ArgumentError.value(migrationName, 'migrationName',
+          'must be a valid identifier (alphanumeric and underscore only)');
+    }
+    if (!MigrationAdapter._validIdentifier(migrationTableName)) {
+      throw ArgumentError.value(migrationTableName, 'migrationTableName',
+          'must be a valid identifier (alphanumeric and underscore only)');
+    }
+  }
 
   static bool _validIdentifier(String name) =>
       RegExp(r'^[a-zA-Z0-9_]+$').hasMatch(name);
