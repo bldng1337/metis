@@ -249,12 +249,17 @@ class DBDataClassAdapter extends Adapter {
     }
   }
 
+  Iterable<Map<String, dynamic>> _rowsAsMaps(Object? result) => [
+        if (result is Iterable)
+          for (final row in result)
+            if (row != null) Map<String, dynamic>.from(row as Map),
+      ];
+
   Stream<T> selectDataClasses<T extends DBConstClass>(DBTable table) async* {
     if (!_classes.containsKey(T)) {
       throw StateError('Class $T not registered');
     }
-    final List<dynamic> data = await db.select(table);
-    yield* _load<T>(data.cast());
+    yield* _load<T>(_rowsAsMaps(await db.select(table)));
   }
 
   Future<T?> selectDataClass<T extends DBConstClass>(DBRecord id) async {
@@ -282,7 +287,7 @@ class DBDataClassAdapter extends Adapter {
       throw StateError(
           'query returned no result sets, expected at least one statement result');
     }
-    yield* _load(data[0].where((item) => item != null).cast());
+    yield* _load(_rowsAsMaps(data[0]));
   }
 
   /// Watches [table] and repeatedly yields the full current list of
