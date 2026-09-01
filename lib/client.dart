@@ -11,9 +11,14 @@ class AdapterSurrealDB implements SurrealDB {
 
   AdapterSurrealDB(this._surreal);
 
+  /// [shareTag] attaches to (or creates) the process-wide shared connection
+  /// registered under that tag, so additional connects — including from
+  /// other isolates — reuse the same engine instead of reopening the
+  /// database file. See [SurrealDB.connect].
   static Future<AdapterSurrealDB> connect(String endpoint,
-      {Options? opts}) async {
-    final surreal = await SurrealDB.connect(endpoint, opts: opts);
+      {Options? opts, String? shareTag}) async {
+    final surreal =
+        await SurrealDB.connect(endpoint, opts: opts, shareTag: shareTag);
     return AdapterSurrealDB(surreal);
   }
 

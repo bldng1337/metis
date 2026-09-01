@@ -5,6 +5,7 @@ import 'crdt.dart' as crdt;
 import 'dataclass.dart' as dataclass;
 import 'fuzz_sync.dart' as fuzz;
 import 'migration.dart' as migration;
+import 'share_tag.dart' as share_tag;
 import 'store.dart' as store;
 import 'sync_http.dart' as sync_http;
 
@@ -14,6 +15,7 @@ void main() {
   group('Dataclass', dataclass.dotest);
   group('Fuzz', fuzz.dotest);
   group('Migration', migration.dotest);
+  group('ShareTag', share_tag.dotest);
   group('Store', store.dotest);
   group('SyncHttp', sync_http.dotest);
 }
