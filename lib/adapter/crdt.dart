@@ -237,14 +237,16 @@ class CrdtAdapter extends Adapter {
     }
   }
 
-  @override
-  Future<void> dispose() async {}
-
   Future<void> _initTableSync() async {
     for (final table in tablesToSync) {
       //TODO: This is a possible injection point but as far as I can tell its not possible to use the vars for a define statement 2.0
       await db.query("""
           DEFINE EVENT OVERWRITE sync ON ${table.table.tb} THEN {
+          // Writes that do not change the record (remote applies of data we
+          // already hold, re-saves of unchanged state) must not restamp the
+          // CRDT row: the new HLC would look like a fresh local change and
+          // echo back and forth between replicas forever.
+          IF \$before == \$after { RETURN NULL; };
           let \$entry = type::record("$crdtTableName",[record::tb(\$value.id),record::id(\$value.id)]);
           let \$now = time::now();
           let \$deleted = \$event == "DELETE";
@@ -292,4 +294,86 @@ class CrdtAdapter extends Adapter {
   }
 
   SyncRepo get syncRepo => CrdtAdapterRepo(adapter: this);
+
+  final _changeController = StreamController<DBRecord>.broadcast();
+  StreamSubscription<Notification>? _changeLiveSub;
+  bool _changeLiveStarting = false;
+
+  /// Live feed of local changes: yields the record id of every entry whose
+  /// CRDT row changed, in write order. Backed by a LIVE SELECT on the CRDT
+  /// table, established lazily on the first watch and shared by all
+  /// listeners; it re-establishes itself with a fixed delay when the
+  /// subscription ends or fails, and errors are forwarded on the stream.
+  Stream<DBRecord> watchChanges() {
+    _ensureChangeLive();
+    return _changeController.stream;
+  }
+
+  void _ensureChangeLive() {
+    if (_changeLiveSub != null || _changeLiveStarting) return;
+    _changeLiveStarting = true;
+    () async {
+      try {
+        final result = await db.query('LIVE SELECT * FROM $crdtTableName;');
+        final id = result[0];
+        final liveId =
+            id is UuidValue ? id : UuidValue.fromString(id as String);
+        _changeLiveSub = db.liveOf(liveId).listen((event) {
+          final entry = _changeEntry(event);
+          if (entry != null && !_changeController.isClosed) {
+            _changeController.add(entry);
+          }
+        }, onError: (Object e, StackTrace s) {
+          if (!_changeController.isClosed) _changeController.addError(e, s);
+          _teardownChangeLive();
+        }, onDone: _teardownChangeLive);
+      } catch (e, s) {
+        if (!_changeController.isClosed) _changeController.addError(e, s);
+        _changeLiveStarting = false;
+        _scheduleChangeLiveRetry();
+      }
+    }();
+  }
+
+  /// A dead live query must be replaced, or no further changes would be
+  /// reported; retrying forever with a fixed delay keeps live consumers
+  /// working across engine restarts without them knowing about it.
+  void _teardownChangeLive() {
+    _changeLiveSub?.cancel();
+    _changeLiveSub = null;
+    _changeLiveStarting = false;
+    _scheduleChangeLiveRetry();
+  }
+
+  Timer? _changeLiveRetry;
+
+  void _scheduleChangeLiveRetry() {
+    if (_changeLiveRetry != null || _changeController.isClosed) return;
+    _changeLiveRetry = Timer(const Duration(seconds: 5), () {
+      _changeLiveRetry = null;
+      _ensureChangeLive();
+    });
+  }
+
+  static DBRecord? _changeEntry(Notification event) {
+    if (event.action == Action.delete) {
+      // CRDT rows are tombstoned (deleted = true), never removed, so a
+      // delete notification can only come from table maintenance; the entry
+      // id is not recoverable from it either.
+      return null;
+    }
+    final result = event.result;
+    if (result is Map) {
+      final entry = result['entry'];
+      if (entry is DBRecord) return entry;
+    }
+    return null;
+  }
+
+  @override
+  Future<void> dispose() async {
+    _changeController.close();
+    _changeLiveRetry?.cancel();
+    await _changeLiveSub?.cancel();
+  }
 }

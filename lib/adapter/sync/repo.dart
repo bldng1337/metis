@@ -184,6 +184,42 @@ abstract class SyncRepo {
             remotedata.entries + localdata.entries));
   }
 
+  /// Synchronizes the single record identified by [id] with [remote],
+  /// following the same last-write-wins rule as [sync]: the side holding the
+  /// newer HLC wins, equal HLCs are a no-op. Returns true when a change was
+  /// applied on either side, false when both sides already agree.
+  ///
+  /// Used by live sync, where a change feed supplies the ids instead of
+  /// walking both repos like [sync] does.
+  Future<bool> syncRecord(SyncRepo remote, DBRecord id) async {
+    final local = await getSyncData(id);
+    final remotemeta = await remote.getSyncData(id);
+    if (local == null && remotemeta == null) {
+      return false;
+    }
+    if (remotemeta == null) {
+      // The both-null case already returned, so local must exist here.
+      await remote.push(local!, await pull(local));
+      return true;
+    }
+    if (local == null) {
+      await push(remotemeta, await remote.pull(remotemeta));
+      return true;
+    }
+    switch (local.compareTo(remotemeta)) {
+      case -1:
+        // local Hlc is older -> remote wins, push remote data to local.
+        await push(remotemeta, await remote.pull(remotemeta));
+        return true;
+      case 0:
+        return false;
+      // local Hlc is newer -> local wins, push local data to remote.
+      default:
+        await remote.push(local, await pull(local));
+        return true;
+    }
+  }
+
   Future<void> _syncdata(SyncRepo remote, int length,
       {Set<String>? syncTables,
       int chunkSize = 50,

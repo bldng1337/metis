@@ -217,6 +217,101 @@ void main() {
     });
   });
 
+  group('SyncRepo.syncRecord', () {
+    const entry = DBRecord('t', 'r');
+    SyncData meta(DateTime ts, int count, String node) => SyncData(
+          hlc: Hlc(ts, count, node),
+          deleted: false,
+          entry: entry,
+        );
+
+    test('pushes local to remote when local is newer', () async {
+      final local = _MockSyncRepo(
+        pointData: const SyncRepoData(version: 1, entries: 1, tables: {}),
+        records: {
+          entry: meta(DateTime.utc(2024, 1, 2), 0, 'a'),
+        },
+      );
+      final remote = _MockSyncRepo(
+        pointData: const SyncRepoData(version: 1, entries: 1, tables: {}),
+        records: {
+          entry: meta(DateTime.utc(2024, 1, 1), 0, 'b'),
+        },
+      );
+      expect(await local.syncRecord(remote, entry), isTrue);
+      expect(remote.pushed, hasLength(1));
+      expect(remote.pushed.single.$1.hlc, local.records[entry]!.hlc);
+      expect(remote.pushed.single.$2, 'data-of-r');
+      expect(local.pushed, isEmpty);
+    });
+
+    test('pulls remote into local when remote is newer', () async {
+      final local = _MockSyncRepo(
+        pointData: const SyncRepoData(version: 1, entries: 1, tables: {}),
+        records: {
+          entry: meta(DateTime.utc(2024, 1, 1), 0, 'a'),
+        },
+      );
+      final remote = _MockSyncRepo(
+        pointData: const SyncRepoData(version: 1, entries: 1, tables: {}),
+        records: {
+          entry: meta(DateTime.utc(2024, 1, 2), 0, 'b'),
+        },
+      );
+      expect(await local.syncRecord(remote, entry), isTrue);
+      expect(local.pushed, hasLength(1));
+      expect(local.pushed.single.$1.hlc, remote.records[entry]!.hlc);
+      expect(local.pushed.single.$2, 'data-of-r');
+      expect(remote.pushed, isEmpty);
+    });
+
+    test('does nothing when both sides agree', () async {
+      final local = _MockSyncRepo(
+        pointData: const SyncRepoData(version: 1, entries: 1, tables: {}),
+        records: {
+          entry: meta(DateTime.utc(2024, 1, 1), 3, 'a'),
+        },
+      );
+      final remote = _MockSyncRepo(
+        pointData: const SyncRepoData(version: 1, entries: 1, tables: {}),
+        records: {
+          entry: meta(DateTime.utc(2024, 1, 1), 3, 'a'),
+        },
+      );
+      expect(await local.syncRecord(remote, entry), isFalse);
+      expect(local.pushed, isEmpty);
+      expect(remote.pushed, isEmpty);
+    });
+
+    test('handles records that exist on only one side', () async {
+      final local = _MockSyncRepo(
+        pointData: const SyncRepoData(version: 1, entries: 1, tables: {}),
+        records: {
+          entry: meta(DateTime.utc(2024, 1, 1), 0, 'a'),
+        },
+      );
+      final remote = _MockSyncRepo(
+        pointData: const SyncRepoData(version: 1, entries: 0, tables: {}),
+      );
+      expect(await local.syncRecord(remote, entry), isTrue);
+      expect(remote.pushed, hasLength(1));
+      expect(remote.pushed.single.$1.hlc, local.records[entry]!.hlc);
+
+      final remoteOnly = _MockSyncRepo(
+        pointData: const SyncRepoData(version: 1, entries: 1, tables: {}),
+        records: {
+          entry: meta(DateTime.utc(2024, 1, 1), 0, 'b'),
+        },
+      );
+      final emptyLocal = _MockSyncRepo(
+        pointData: const SyncRepoData(version: 1, entries: 0, tables: {}),
+      );
+      expect(await emptyLocal.syncRecord(remoteOnly, entry), isTrue);
+      expect(emptyLocal.pushed, hasLength(1));
+      expect(emptyLocal.pushed.single.$1.hlc, remoteOnly.records[entry]!.hlc);
+    });
+  });
+
   group('DBChange', () {
     test('carries the database diff ops verbatim', () {
       const ops = [
@@ -239,8 +334,10 @@ void main() {
 /// Minimal in-memory [SyncRepo] for logic tests.
 class _MockSyncRepo extends SyncRepo {
   final SyncRepoData pointData;
+  final Map<DBRecord, SyncData> records;
+  final List<(SyncData, dynamic)> pushed = [];
 
-  _MockSyncRepo({required this.pointData});
+  _MockSyncRepo({required this.pointData, this.records = const {}});
 
   @override
   Future<SyncRepoData> getSyncPointData() async => pointData;
@@ -249,11 +346,12 @@ class _MockSyncRepo extends SyncRepo {
   Stream<SyncData> querySyncData(int offset, int limit) async* {}
 
   @override
-  Future<SyncData?> getSyncData(DBRecord id) async => null;
+  Future<SyncData?> getSyncData(DBRecord id) async => records[id];
 
   @override
-  Future<dynamic> pull(SyncData meta) async => null;
+  Future<dynamic> pull(SyncData meta) async => 'data-of-${meta.entry.id}';
 
   @override
-  Future<void> push(SyncData meta, dynamic data) async {}
+  Future<void> push(SyncData meta, dynamic data) async =>
+      pushed.add((meta, data));
 }
