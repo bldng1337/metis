@@ -229,4 +229,14 @@ class AdapterSurrealDB implements SurrealDB {
   Future<void> unset(String name) {
     return _surreal.unset(name);
   }
+
+    @override
+    Future<SurrealTransaction> beginTransaction() {
+      return _surreal.beginTransaction();
+    }
+
+    @override
+    Future<T> transaction<T>(Future<T> Function(SurrealTransaction txn) body) async {
+      return await _surreal.transaction(body);
+    }
 }
