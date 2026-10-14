@@ -17,7 +17,7 @@ abstract class FuzzSyncStrategy {
 
   /// Synchronize [local] with [remote]. Must converge both sides to the
   /// union of the two states.
-  Future<void> sync(CrdtAdapter local, SyncRepo remote);
+  Future<void> sync(CrdtAdapter local, SyncRepo remote, {int chunkSize = 50});
 }
 
 /// Synchronizes in-process, calling [CrdtAdapter.sync] directly against the
@@ -28,7 +28,8 @@ class DirectFuzzSync extends FuzzSyncStrategy {
   String get name => 'direct';
 
   @override
-  Future<void> sync(CrdtAdapter local, SyncRepo remote) => local.sync(remote);
+  Future<void> sync(CrdtAdapter local, SyncRepo remote, {int chunkSize = 50}) =>
+      local.sync(remote, chunkSize: chunkSize);
 }
 
 /// Synchronizes over real HTTP using [SyncHttpServer] / [SyncHttpClient],
@@ -39,7 +40,8 @@ class HttpFuzzSync extends FuzzSyncStrategy {
   String get name => 'http';
 
   @override
-  Future<void> sync(CrdtAdapter local, SyncRepo remote) async {
+  Future<void> sync(CrdtAdapter local, SyncRepo remote,
+      {int chunkSize = 50}) async {
     final handler = SyncHttpHandler(repo: remote);
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final sub = server.listen((req) async {
@@ -50,13 +52,47 @@ class HttpFuzzSync extends FuzzSyncStrategy {
       client: HttpClient(),
     );
     try {
-      await local.sync(httpClient);
+      await local.sync(httpClient, chunkSize: chunkSize);
     } finally {
       httpClient.dispose();
       await sub.cancel();
       await server.close(force: true);
     }
   }
+}
+
+/// Decorator that delays every page read, keeping the walked table open for
+/// mutation far longer than an in-process call would. Used by the concurrent
+/// fuzz mode: both sides then reliably interleave pushes into the table the
+/// other side is paging through, which is what real devices do over the LAN
+/// (and what pure in-process interleaving only does by scheduling luck).
+///
+/// Extends (not implements) [SyncRepo] so the inherited [SyncRepo.sync] and
+/// [SyncRepo.syncRecord] drive the overridden page reads through this
+/// decorator too.
+class DelayedPagesRepo extends SyncRepo {
+  final SyncRepo inner;
+  final Duration delay;
+
+  DelayedPagesRepo(this.inner, {this.delay = const Duration(milliseconds: 5)});
+
+  @override
+  Future<SyncRepoData> getSyncPointData() => inner.getSyncPointData();
+
+  @override
+  Stream<SyncData> querySyncData(DBRecord? after, int limit) async* {
+    await Future<void>.delayed(delay);
+    yield* inner.querySyncData(after, limit);
+  }
+
+  @override
+  Future<SyncData?> getSyncData(DBRecord id) => inner.getSyncData(id);
+
+  @override
+  Future<dynamic> pull(SyncData meta) => inner.pull(meta);
+
+  @override
+  Future<void> push(SyncData meta, dynamic data) => inner.push(meta, data);
 }
 
 /// One recorded mutation, for reproducible failure diagnostics.
@@ -123,6 +159,18 @@ Future<FuzzState> _snapshot(AdapterSurrealDB db) async {
 /// HLC can never leak back out and overwrite a newer value on the edges.
 ///
 /// [seed] drives all randomness; reuse it to reproduce a failure.
+///
+/// [chunkSize] pages the sync walks (the default pool sizes fit in one
+/// default-sized page, so small chunks are needed to exercise pagination).
+///
+/// [concurrent] runs both sync directions simultaneously instead of
+/// sequentially — dion's autoSync defaults to on for every device, so two
+/// paired devices kick off full syncs against each other at the same time;
+/// the walk must survive the peer inserting rows into the walked table.
+///
+/// [wipeEdgeAfterFirstRound] clears one edge's data AND crdt tables after the
+/// first sync round (dion's fixed "Clear Database"): the cleared edge must
+/// then resurrect everything from its peers and the peers must not lose data.
 Future<void> runFuzz(
   FuzzSyncStrategy strategy, {
   required int seed,
@@ -130,6 +178,9 @@ Future<void> runFuzz(
   int mutations = 40,
   int recordPool = 8,
   int opDelayMs = 5,
+  int chunkSize = 50,
+  bool concurrent = false,
+  int? wipeEdgeAfterFirstRound,
 }) async {
   assert(edgeCount >= 2, 'Need at least two edges to cross-sync.');
   final rng = FuzzRng(seed);
@@ -197,11 +248,29 @@ Future<void> runFuzz(
     // because last-write-wins is total under distinct timestamps.
     final rounds = edgeCount;
     for (int round = 0; round < rounds; round++) {
+      if (wipeEdgeAfterFirstRound != null && round == 1) {
+        // The first round has spread every edge's unique records and
+        // tombstones to its neighbors, so wiping this edge now loses nothing
+        // that cannot be resurrected from them. Data tables first, crdt last
+        // (the data deletes re-stamp tombstones), mirroring dion's clear().
+        // Plain sequential deletes: nothing runs concurrently at this point.
+        final db = dbs[1 + wipeEdgeAfterFirstRound];
+        await db.query('DELETE FROM fuzz;');
+        await db.query('DELETE FROM crdt;');
+      }
       for (int i = 0; i < edgeCount; i++) {
         final a = crdts[1 + i];
         final b = crdts[1 + (i + 1) % edgeCount];
-        await strategy.sync(a, b.syncRepo);
-        await strategy.sync(b, a.syncRepo);
+        if (concurrent) {
+          final futureA = strategy.sync(a, DelayedPagesRepo(b.syncRepo),
+              chunkSize: chunkSize);
+          final futureB = strategy.sync(b, DelayedPagesRepo(a.syncRepo),
+              chunkSize: chunkSize);
+          await Future.wait([futureA, futureB]);
+        } else {
+          await strategy.sync(a, b.syncRepo, chunkSize: chunkSize);
+          await strategy.sync(b, a.syncRepo, chunkSize: chunkSize);
+        }
       }
     }
 
@@ -270,6 +339,57 @@ void dotest() {
           );
         });
       }
+    });
+
+    // Regression shapes for the wild-caught bugs; each one caught a real
+    // defect at the time it was added:
+    // - paged: pool >> chunk, many mutations — the walk must not skip rows.
+    // - concurrent: both directions at once with slowed page reads — dion's
+    //   autoSync default; offset pagination lost records here.
+    // - wipe: clear data+crdt on one edge mid-run — "Clear Database" must
+    //   resurrect from peers, not wipe them.
+    group('Fuzz/${strategy.name}/paged', () {
+      test('converges with a record pool far beyond the chunk size (seed 11)',
+          () async {
+        await runFuzz(
+          strategy,
+          seed: 11,
+          edgeCount: 2,
+          mutations: 160,
+          recordPool: 120,
+          chunkSize: 7,
+        );
+      });
+    });
+
+    group('Fuzz/${strategy.name}/concurrent', () {
+      test('converges when both sides sync simultaneously (seed 12, paged)',
+          () async {
+        await runFuzz(
+          strategy,
+          seed: 12,
+          edgeCount: 2,
+          mutations: 120,
+          recordPool: 90,
+          chunkSize: 7,
+          concurrent: true,
+        );
+      });
+    });
+
+    group('Fuzz/${strategy.name}/wipe', () {
+      test('a cleared edge resurrects without wiping its peers (seed 13)',
+          () async {
+        await runFuzz(
+          strategy,
+          seed: 13,
+          edgeCount: 3,
+          mutations: 60,
+          recordPool: 10,
+          chunkSize: 7,
+          wipeEdgeAfterFirstRound: 0,
+        );
+      });
     });
   }
 

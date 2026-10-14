@@ -24,10 +24,14 @@ class MockSyncRepo extends SyncRepo {
   Future<SyncRepoData> getSyncPointData() async => pointData;
 
   @override
-  Stream<SyncData> querySyncData(int offset, int limit) async* {
+  Stream<SyncData> querySyncData(DBRecord? after, int limit) async* {
     final list = data.values.toList();
-    final end = (offset + limit > list.length) ? list.length : offset + limit;
-    for (int i = offset; i < end; i++) {
+    int start = 0;
+    if (after != null) {
+      start = list.indexWhere((e) => e.entry == after) + 1;
+    }
+    final end = (start + limit > list.length) ? list.length : start + limit;
+    for (int i = start; i < end; i++) {
       yield list[i];
     }
   }
@@ -224,7 +228,7 @@ void dotest() {
     syncClient = SyncHttpClient(
         url: 'http://${server.address.host}:${server.port}',
         client: HttpClient());
-    final results = await syncClient.querySyncData(0, 10).toList();
+    final results = await syncClient.querySyncData(null, 10).toList();
     expect(results.length, 1);
     expect(results.first.entry, testRecord);
   });
@@ -283,7 +287,7 @@ void dotest() {
     await syncClient.push(newRecord, {'pushed': true});
     expect(mockRepo.data[const DBRecord('test', 'pushed1')], isNotNull);
 
-    final queried = await syncClient.querySyncData(0, 100).toList();
+    final queried = await syncClient.querySyncData(null, 100).toList();
     expect(queried.isNotEmpty, isTrue);
   });
 
@@ -302,7 +306,7 @@ void dotest() {
         url: 'http://${testServer.address.host}:${testServer.port}',
         client: HttpClient());
 
-    final results = await syncClient.querySyncData(0, 10).toList();
+    final results = await syncClient.querySyncData(null, 10).toList();
     expect(results, isEmpty);
     await testServer.close(force: true);
   });
@@ -339,9 +343,11 @@ void dotest() {
         url: 'http://${testServer.address.host}:${testServer.port}',
         client: HttpClient());
 
-    final page1 = await syncClient.querySyncData(0, 2).toList();
-    final page2 = await syncClient.querySyncData(2, 2).toList();
-    final page3 = await syncClient.querySyncData(4, 2).toList();
+    // Keyset pagination: each page is the rows after the previous page's last
+    // record, so pages tile the whole set without offsets.
+    final page1 = await syncClient.querySyncData(null, 2).toList();
+    final page2 = await syncClient.querySyncData(page1.last.entry, 2).toList();
+    final page3 = await syncClient.querySyncData(page2.last.entry, 2).toList();
     expect(page1.length, 2);
     expect(page2.length, 2);
     expect(page3.length, 1);
@@ -360,7 +366,7 @@ void dotest() {
 
       final pointData = await stack.httpClient.getSyncPointData();
       expect(pointData.entries, 1);
-      expect(pointData.version, 1);
+      expect(pointData.version, CrdtAdapterRepo.version);
 
       await stack.clientCrdt.sync(stack.httpClient);
 

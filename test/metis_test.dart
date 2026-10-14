@@ -217,6 +217,79 @@ void main() {
     });
   });
 
+  group('SyncRepo.sync walker (keyset pagination)', () {
+    SyncData row(String id, DateTime ts) => SyncData(
+          hlc: Hlc(ts, 0, 'remote'),
+          deleted: false,
+          entry: DBRecord('t', id),
+        );
+
+    test('pages the remote with the last row as cursor, not offsets', () async {
+      final base = DateTime.utc(2024, 1, 1);
+      final remote = _PagingRepo([
+        for (int i = 0; i < 5; i++) row('r$i', base.add(Duration(seconds: i))),
+      ]);
+      final local = _PagingRepo(<SyncData>[]);
+
+      await local.sync(remote, chunkSize: 2);
+
+      // 5 rows in pages of 2: three data pages plus the empty page that
+      // ends the walk; each page starts after the previous page's last row.
+      expect(remote.requestedCursors, [
+        null,
+        const DBRecord('t', 'r1'),
+        const DBRecord('t', 'r3'),
+        const DBRecord('t', 'r4'),
+      ]);
+      expect(local.pushed.map((e) => e.$1.entry.id), hasLength(5));
+    });
+
+    test('a concurrent insert before the cursor cannot skip existing rows',
+        () async {
+      // With offsets, an insert that sorts before the read position shifts
+      // rows past the offset and the next page skips one. With a cursor the
+      // next page is anchored to the last seen row, so nothing is skipped.
+      final base = DateTime.utc(2024, 1, 1);
+      final rows = [
+        for (int i = 0; i < 4; i++) row('r$i', base.add(Duration(seconds: i))),
+      ];
+      final remote = _PagingRepo(rows);
+      final local = _PagingRepo(<SyncData>[]);
+      remote.onAfterPage = (page) {
+        if (remote.requestedCursors.length == 1) {
+          // inserts before the walk's current position, like a concurrent
+          // sync pushing rows into the walked table
+          rows.insert(
+              0, row('inserted0', base.add(const Duration(minutes: 1))));
+          rows.insert(
+              1, row('inserted1', base.add(const Duration(minutes: 2))));
+        }
+      };
+
+      await local.sync(remote, chunkSize: 2);
+
+      expect(local.pushed.map((e) => e.$1.entry.id),
+          containsAll(['r0', 'r1', 'r2', 'r3']));
+    });
+
+    test('local-newer rows are pushed to the remote after the walk', () async {
+      final base = DateTime.utc(2024, 1, 1);
+      final remote = _PagingRepo([row('r0', base), row('r1', base)]);
+      final local = _PagingRepo([
+        SyncData(
+          hlc: Hlc(base.add(const Duration(hours: 1)), 0, 'local'),
+          deleted: false,
+          entry: const DBRecord('t', 'mine'),
+        ),
+      ]);
+
+      await local.sync(remote, chunkSize: 50);
+
+      expect(remote.pushed.map((e) => e.$1.entry.id), ['mine']);
+      expect(local.pushed.map((e) => e.$1.entry.id), isNot(contains('mine')));
+    });
+  });
+
   group('SyncRepo.syncRecord', () {
     const entry = DBRecord('t', 'r');
     SyncData meta(DateTime ts, int count, String node) => SyncData(
@@ -343,7 +416,7 @@ class _MockSyncRepo extends SyncRepo {
   Future<SyncRepoData> getSyncPointData() async => pointData;
 
   @override
-  Stream<SyncData> querySyncData(int offset, int limit) async* {}
+  Stream<SyncData> querySyncData(DBRecord? after, int limit) async* {}
 
   @override
   Future<SyncData?> getSyncData(DBRecord id) async => records[id];
@@ -354,4 +427,62 @@ class _MockSyncRepo extends SyncRepo {
   @override
   Future<void> push(SyncData meta, dynamic data) async =>
       pushed.add((meta, data));
+}
+
+/// A [SyncRepo] whose CRDT rows are an explicit ordered list, so tests can
+/// observe (and mutate mid-walk) what the sync walker pages over.
+class _PagingRepo extends SyncRepo {
+  final List<SyncData> rows;
+  final List<DBRecord?> requestedCursors = [];
+  final List<(SyncData, dynamic)> pushed = [];
+  final Set<SyncTable> tables;
+
+  /// Invoked after each page is materialized, before it is handed to the
+  /// walker; lets a test mutate [rows] like a concurrent writer would.
+  void Function(List<SyncData> page)? onAfterPage;
+
+  _PagingRepo(this.rows, {Set<SyncTable>? tables})
+      : tables = tables ??
+            {
+              const SyncTable(
+                  table: DBTable('t'),
+                  version: 1,
+                  range: VersionRange.exact(1)),
+            };
+
+  @override
+  Future<SyncRepoData> getSyncPointData() async =>
+      SyncRepoData(version: 1, entries: rows.length, tables: tables);
+
+  @override
+  Stream<SyncData> querySyncData(DBRecord? after, int limit) async* {
+    int start = 0;
+    if (after != null) {
+      start = rows.indexWhere((r) => r.entry == after) + 1;
+    }
+    final page = <SyncData>[];
+    for (int i = start; i < rows.length && page.length < limit; i++) {
+      page.add(rows[i]);
+    }
+    requestedCursors.add(after);
+    onAfterPage?.call(page);
+    yield* Stream.fromIterable(page);
+  }
+
+  @override
+  Future<SyncData?> getSyncData(DBRecord id) async {
+    for (final r in rows) {
+      if (r.entry == id) return r;
+    }
+    return null;
+  }
+
+  @override
+  Future<dynamic> pull(SyncData meta) async => {'v': meta.entry.id};
+
+  @override
+  Future<void> push(SyncData meta, dynamic data) async {
+    rows.add(meta);
+    pushed.add((meta, data));
+  }
 }

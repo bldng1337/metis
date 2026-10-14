@@ -138,7 +138,16 @@ class TableMismatchException implements Exception {
 abstract class SyncRepo {
   Future<SyncRepoData> getSyncPointData();
 
-  Stream<SyncData> querySyncData(int offset, int limit);
+  /// Pages through this repo's CRDT metadata in record-id order. [after] is
+  /// the entry record id of the last [SyncData] of the previous page (null
+  /// starts from the beginning).
+  ///
+  /// This is keyset pagination, not offset pagination: a peer may insert rows
+  /// into the walked table while the walk is in progress (its own sync or a
+  /// live push). With offsets, an insert before the cursor shifts rows past
+  /// the cursor and the next page silently skips them, losing records; with a
+  /// cursor, rows after the cursor are unaffected by inserts before it.
+  Stream<SyncData> querySyncData(DBRecord? after, int limit);
 
   Future<SyncData?> getSyncData(DBRecord id);
 
@@ -225,12 +234,14 @@ abstract class SyncRepo {
       int chunkSize = 50,
       void Function(int progress, int total)? onProgress}) async {
     final deferred = <(SyncData, dynamic)>[];
-    int offset = 0;
+    DBRecord? after;
+    int processed = 0;
     while (true) {
-      onProgress?.call(offset, length);
-      final page = await remote.querySyncData(offset, chunkSize).toList();
+      onProgress?.call(processed, length);
+      final page = await remote.querySyncData(after, chunkSize).toList();
       if (page.isEmpty) break;
-      offset += page.length;
+      after = page.last.entry;
+      processed += page.length;
       for (final remotesync in page) {
         if (syncTables != null && !syncTables.contains(remotesync.entry.tb)) {
           continue;
@@ -330,9 +341,9 @@ class SyncHttpClient extends SyncRepo {
   }
 
   @override
-  Stream<SyncData> querySyncData(int offset, int limit) async* {
+  Stream<SyncData> querySyncData(DBRecord? after, int limit) async* {
     final content = await _request('/querySyncData', {
-      'offset': offset,
+      'after': after?.toJson(),
       'limit': limit,
     });
     final list = jsonDecode(content, reviver: revive) as List<dynamic>;
@@ -455,9 +466,14 @@ class SyncHttpHandler {
     } else if (path == "/querySyncData") {
       final content = await utf8.decoder.bind(req).join();
       final data = jsonDecode(content, reviver: revive) as Map<String, dynamic>;
-      final offset = data['offset'] as int? ?? 0;
+      final afterRaw = data['after'];
+      final after = afterRaw == null
+          ? null
+          : afterRaw is DBRecord
+              ? afterRaw
+              : DBRecord.fromJson(afterRaw as Map<String, dynamic>);
       final limit = data['limit'] as int? ?? 50;
-      final res = await repo.querySyncData(offset, limit).toList();
+      final res = await repo.querySyncData(after, limit).toList();
       req.response
         ..statusCode = HttpStatus.ok
         ..write(jsonEncode(res.map((e) => e.toJson()).toList(),

@@ -27,30 +27,39 @@ extension AdapterCrdtExt on AdapterSurrealDB {
 }
 
 class CrdtAdapterRepo extends SyncRepo {
+  /// Version of the sync repo protocol (wire format of /querySyncData and the
+  /// push semantics). Bumped when the format changes so mixed-version peers
+  /// fail negotiation with VersionMismatchException instead of
+  /// misinterpreting each other's requests. v2: offset pagination -> cursor
+  /// pagination, push applies only strictly-newer HLCs.
+  static const version = 2;
+
   final CrdtAdapter adapter;
 
   CrdtAdapterRepo({
     required this.adapter,
   });
 
-  Future<List<SyncData>> _querySyncData(int offset, int limit) async {
+  Future<List<SyncData>> _querySyncData(DBRecord? after, int limit) async {
+    // Keyset pagination (see SyncRepo.querySyncData): the cursor is the last
+    // row's record id, which stays valid while rows are inserted concurrently.
     final data = await adapter.db.query(
         """
-              RETURN SELECT * FROM type::table(\$table) ORDER BY id LIMIT \$limit START \$offset;
+              RETURN SELECT * FROM type::table(\$table) ${after == null ? '' : 'WHERE id > \$after'} ORDER BY id LIMIT \$limit;
               """
             .trim(),
         vars: {
-          "offset": offset,
           "limit": limit,
-          "table": adapter.crdtTableName
+          "table": adapter.crdtTableName,
+          if (after != null) "after": adapter._getSyncRecord(after),
         });
     final List<dynamic> list = data[0];
     return list.map((e) => SyncData.fromDB(e)).toList();
   }
 
   @override
-  Stream<SyncData> querySyncData(int offset, int limit) {
-    return _querySyncData(offset, limit).asStream().expand((e) => e);
+  Stream<SyncData> querySyncData(DBRecord? after, int limit) {
+    return _querySyncData(after, limit).asStream().expand((e) => e);
   }
 
   @override
@@ -75,43 +84,42 @@ class CrdtAdapterRepo extends SyncRepo {
     }
     final payload =
         data is Map ? (Map<String, dynamic>.from(data)..remove('id')) : data;
-    if (data == null) {
-      // Raw DELETE is used instead of the delete method because the delete method requires the record to exist, which we cannot guarantee.
-      await adapter.db.query(
-          """
-      BEGIN TRANSACTION;
-      DELETE FROM \$entry;
-      UPSERT \$meta CONTENT \$crdt;
-      COMMIT TRANSACTION;
-      """
-              .trim(),
-          vars: {
-            "entry": meta.entry,
-            "meta": adapter._getSyncRecord(meta.entry),
-            "crdt": meta.toDB(),
-          });
-    } else {
-      await adapter.db.query(
-          """
-      BEGIN TRANSACTION;
-      UPSERT \$entry CONTENT \$data;
-      UPSERT \$meta CONTENT \$crdt;
-      COMMIT TRANSACTION;
-      """
-              .trim(),
-          vars: {
-            "entry": meta.entry,
-            "meta": adapter._getSyncRecord(meta.entry),
-            "crdt": meta.toDB(),
-            "data": payload,
-          });
-    }
+    // The initiator compares HLCs before pushing, but between its comparison
+    // and this apply a concurrent sync or live push may have written a newer
+    // version to this row. Apply only if the incoming HLC is strictly newer;
+    // an equal HLC is the same write (a no-op that must not restamp the row),
+    // an older one loses last-write-wins. The check and the writes share one
+    // ID-based transaction, so they are atomic even while other pushes run
+    // concurrently on the same connection; writeTransaction retries the
+    // whole body when such a concurrent writer makes the store reject the
+    // commit. (ID-based transactions, not raw BEGIN/COMMIT strings: those
+    // bind to the session, and a second concurrent one on the same
+    // connection fails the query.)
+    await adapter.db.writeTransaction((txn) async {
+      final currRow = await txn.select(adapter._getSyncRecord(meta.entry));
+      if (currRow != null) {
+        final curr = SyncData.fromDB(Map<String, dynamic>.from(currRow as Map));
+        if (meta.hlc.compareTo(curr.hlc) <= 0) return;
+      }
+      if (data == null) {
+        // Raw DELETE instead of the delete method: the record is not
+        // guaranteed to exist, and deleting a missing record must not fail.
+        await txn.query('DELETE FROM \$entry;', vars: {'entry': meta.entry});
+      } else {
+        await txn.query('UPSERT \$entry CONTENT \$data;',
+            vars: {'entry': meta.entry, 'data': payload});
+      }
+      await txn.query('UPSERT \$meta CONTENT \$crdt;', vars: {
+        'meta': adapter._getSyncRecord(meta.entry),
+        'crdt': meta.toDB(),
+      });
+    });
   }
 
   @override
   Future<SyncRepoData> getSyncPointData() async {
     return SyncRepoData(
-        version: 1,
+        version: version,
         entries: (await adapter.db
                 .query('COUNT(SELECT * FROM type::table(\$table))', vars: {
           "table": adapter.crdtTableName,

@@ -8,6 +8,7 @@ import 'migration.dart' as migration;
 import 'share_tag.dart' as share_tag;
 import 'store.dart' as store;
 import 'sync_http.dart' as sync_http;
+import 'sync_scenarios.dart' as scenarios;
 
 void main() {
   setUpAll(() async => await SurrealDB.ensureInitialized());
@@ -18,4 +19,5 @@ void main() {
   group('ShareTag', share_tag.dotest);
   group('Store', store.dotest);
   group('SyncHttp', sync_http.dotest);
+  group('SyncScenarios', scenarios.dotest);
 }

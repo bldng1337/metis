@@ -5,6 +5,34 @@ import 'package:flutter_surrealdb/flutter_surrealdb.dart';
 import 'package:metis/adapter.dart';
 import 'package:uuid/uuid_value.dart';
 
+/// Runs [body] in an ID-based transaction, retrying when the store's
+/// optimistic concurrency rejects the commit ("Transaction conflict: Write
+/// conflict, retry the transaction") because another writer touched the same
+/// keys first — routine when two syncs or a live push target one database.
+/// [body] must be idempotent from a fresh snapshot (re-read what it decides
+/// on); it is executed anew on every attempt. Conflicts are detected by
+/// message: the engine surfaces them as an opaque AnyhowException with no
+/// typed counterpart.
+extension SurrealWriteTransactionX on SurrealDB {
+  Future<T> writeTransaction<T>(
+      Future<T> Function(SurrealTransaction txn) body) async {
+    const maxAttempts = 8;
+    for (var attempt = 0;; attempt++) {
+      try {
+        return await transaction(body);
+      } catch (e) {
+        if (attempt >= maxAttempts - 1 ||
+            !e.toString().contains('Transaction conflict')) {
+          rethrow;
+        }
+        // Conflicting writers finish quickly, so exponential backoff from
+        // 1ms is enough spacing in practice.
+        await Future<void>.delayed(Duration(milliseconds: 1 << attempt));
+      }
+    }
+  }
+}
+
 class AdapterSurrealDB implements SurrealDB {
   final SurrealDB _surreal;
   final Map<(Type, String), Adapter> _adapters = {};
@@ -97,8 +125,7 @@ class AdapterSurrealDB implements SurrealDB {
   }
 
   @override
-  Future<dynamic> relate(
-      Resource inRecord, String relation, Resource outRecord,
+  Future<dynamic> relate(Resource inRecord, String relation, Resource outRecord,
       {dynamic data}) {
     return _surreal.relate(inRecord, relation, outRecord, data: data);
   }
@@ -230,13 +257,14 @@ class AdapterSurrealDB implements SurrealDB {
     return _surreal.unset(name);
   }
 
-    @override
-    Future<SurrealTransaction> beginTransaction() {
-      return _surreal.beginTransaction();
-    }
+  @override
+  Future<SurrealTransaction> beginTransaction() {
+    return _surreal.beginTransaction();
+  }
 
-    @override
-    Future<T> transaction<T>(Future<T> Function(SurrealTransaction txn) body) async {
-      return await _surreal.transaction(body);
-    }
+  @override
+  Future<T> transaction<T>(
+      Future<T> Function(SurrealTransaction txn) body) async {
+    return await _surreal.transaction(body);
+  }
 }
