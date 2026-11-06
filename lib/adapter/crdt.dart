@@ -235,9 +235,9 @@ class CrdtAdapter extends Adapter {
 
   Future<void> onMigrate(SurrealDB db, int from, int to) async {
     if (from < 2) {
-      // v1 rows have no node id.
       await db.query(
-          'DEFINE FIELD IF NOT EXISTS node ON TABLE $crdtTableName TYPE string;');
+          'DEFINE FIELD IF NOT EXISTS node ON TABLE $crdtTableName TYPE string '
+          'MIGRATE EXISTING ROWS AS v2_node_backfill USING "";');
       await db.query('UPDATE type::table(\$table) SET node = \$node;', vars: {
         "table": crdtTableName,
         "node": nodeId,

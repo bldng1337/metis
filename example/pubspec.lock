@@ -159,8 +159,8 @@ packages:
     dependency: transitive
     description:
       path: "."
-      ref: "6590de485fda46682e2e8c8542d15c6c4a6d68c5"
-      resolved-ref: "6590de485fda46682e2e8c8542d15c6c4a6d68c5"
+      ref: a614e3bcf82c4a3bbb7fffb2a55519e9176dbd9b
+      resolved-ref: a614e3bcf82c4a3bbb7fffb2a55519e9176dbd9b
       url: "https://github.com/bldng1337/flutter_surrealdb.git"
     source: git
     version: "0.0.1"

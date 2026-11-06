@@ -161,7 +161,51 @@ class DBDataClassAdapter extends Adapter {
     if (data is DBModifiableClass &&
         data._loadId != data.dbId &&
         data._loadId != null) {
-      // update db pos as it has changed
+      await _moveRecord(data, json);
+      return;
+    }
+    await _writeRecord(data, json);
+  }
+
+  void _armEcho(DBModifiableClass data, DBRecord id) {
+    _cache[id] = data;
+    data._loadId = id;
+    data._pendingEcho++;
+  }
+
+  void _disarmEcho(DBModifiableClass data, DBRecord id,
+      {DBRecord? previousId, bool wasCached = false}) {
+    if (!wasCached) _cache.remove(id);
+    if (previousId != null) {
+      _cache[previousId] = data;
+      data._loadId = previousId;
+    }
+    data._pendingEcho--;
+  }
+
+  Future<void> _writeRecord(
+      DBConstClass data, Map<String, dynamic> json) async {
+    if (data is! DBModifiableClass) {
+      await db.upsert(data.dbId, json);
+      return;
+    }
+    final wasCached = identical(_cache[data.dbId], data);
+    _armEcho(data, data.dbId);
+    try {
+      await db.upsert(data.dbId, json);
+    } catch (e) {
+      _disarmEcho(data, data.dbId, wasCached: wasCached);
+      rethrow;
+    }
+  }
+
+  Future<void> _moveRecord(
+      DBModifiableClass data, Map<String, dynamic> json) async {
+    final oldId = data._loadId!;
+    final wasCached = identical(_cache[data.dbId], data);
+    _cache.remove(oldId);
+    _armEcho(data, data.dbId);
+    try {
       await db.query(
           """
         BEGIN TRANSACTION;
@@ -174,23 +218,12 @@ class DBDataClassAdapter extends Adapter {
             "table": data.dbId.tb,
             "id": data.dbId.id,
             "data": json,
-            "oldid": data._loadId!.id,
+            "oldid": oldId.id,
           });
-      invalidate(data._loadId!);
-      _afterWrite(data, data.dbId);
-      return;
+    } catch (e) {
+      _disarmEcho(data, data.dbId, previousId: oldId, wasCached: wasCached);
+      rethrow;
     }
-    await db.upsert(data.dbId, json);
-    _afterWrite(data, data.dbId);
-  }
-
-  /// Caches the instance (modifiable classes only) and counts the write so
-  /// the incoming live echo is recognized as ours.
-  void _afterWrite(DBConstClass data, DBRecord id) {
-    if (data is! DBModifiableClass) return;
-    _cache[id] = data;
-    data._loadId = id;
-    data._pendingEcho++;
   }
 
   /// Returns the cached instance for [item]'s id, or constructs one via the

@@ -4,8 +4,6 @@ import 'dart:io';
 
 import 'package:crdt/crdt.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:flutter_surrealdb/flutter_surrealdb.dart';
-import 'package:metis/adapter/migration.dart';
 import 'package:metis/adapter/sync/repo.dart';
 import 'package:metis/metis.dart';
 

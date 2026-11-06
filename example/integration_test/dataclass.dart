@@ -133,16 +133,15 @@ void main() {
 }
 
 void dotest() {
-  AdapterSurrealDB? _db;
+  AdapterSurrealDB? holder;
   late AdapterSurrealDB db;
   late DBDataClassAdapter data;
 
   setUp(() async {
-    if (_db != null) {
-      _db!.dispose();
-    }
-    _db = AdapterSurrealDB(await SurrealDB.connect("mem://"));
-    db = _db!;
+    holder?.dispose();
+    final next = AdapterSurrealDB(await SurrealDB.connect("mem://"));
+    holder = next;
+    db = next;
     await db.use(
       db: 'test',
       ns: 'test',
