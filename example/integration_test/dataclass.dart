@@ -280,6 +280,55 @@ void dotest() {
     expect(test.value, 5);
   });
 
+  test('saves that change nothing do not swallow later remote writes',
+      () async {
+    final test = LiveTestData(value: 1);
+    await data.save(test);
+    await Future.delayed(const Duration(milliseconds: 100));
+
+    for (var i = 0; i < 3; i++) {
+      await data.save(test);
+      await Future.delayed(const Duration(milliseconds: 50));
+    }
+    expect(test.lastChange, isNull);
+
+    await db.upsert(test.dbId, {'value': 2});
+    await Future.delayed(const Duration(milliseconds: 100));
+    expect(test.lastChange, isNotNull,
+        reason: 'the first remote write after no-op saves must be delivered');
+    expect(test.value, 2);
+  });
+
+  test('concurrent loads share one instance', () async {
+    final test = AsyncTestData(somedata: 1, somenum: 7);
+    await db.upsert(test.dbId, {'somedata': 1, 'somenum': 7.0});
+    final loaded = await Future.wait([
+      data.selectDataClass<AsyncTestData>(test.dbId),
+      data.selectDataClass<AsyncTestData>(test.dbId),
+    ]);
+    expect(loaded[0], isNotNull);
+    expect(identical(loaded[0], loaded[1]), isTrue);
+    expect(data.loadedClasses, 1);
+  });
+
+  test('cached instances keep live updates after the last watcher leaves',
+      () async {
+    final test = LiveTestData(value: 1);
+    await data.save(test);
+    await Future.delayed(const Duration(milliseconds: 100));
+
+    final sub = data
+        .watchDataClasses<LiveTestData>(const DBTable('LiveTestData'))
+        .listen((_) {});
+    await Future.delayed(const Duration(milliseconds: 100));
+    await sub.cancel();
+    await Future.delayed(const Duration(milliseconds: 100));
+
+    await db.upsert(test.dbId, {'value': 2});
+    await Future.delayed(const Duration(milliseconds: 100));
+    expect(test.value, 2);
+  });
+
   test('onDBChange receives deletes and marks the instance deleted', () async {
     final test = LiveTestData(value: 1);
     await data.save(test);

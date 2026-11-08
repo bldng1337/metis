@@ -191,12 +191,23 @@ class DBDataClassAdapter extends Adapter {
     }
     final wasCached = identical(_cache[data.dbId], data);
     _armEcho(data, data.dbId);
+    final bool changed;
     try {
-      await db.upsert(data.dbId, json);
+      changed = await _upsertReportingChange(data.dbId, json);
     } catch (e) {
       _disarmEcho(data, data.dbId, wasCached: wasCached);
       rethrow;
     }
+    if (!changed && data._pendingEcho > 0) data._pendingEcho--;
+  }
+
+  Future<bool> _upsertReportingChange(
+      DBRecord id, Map<String, dynamic> json) async {
+    final result = await db.query(r'UPSERT $id CONTENT $data RETURN DIFF;',
+        vars: {'id': id, 'data': json});
+    final rows = result[0];
+    return rows is! List ||
+        rows.any((ops) => ops is! List || ops.isNotEmpty);
   }
 
   Future<void> _moveRecord(
@@ -235,14 +246,8 @@ class DBDataClassAdapter extends Adapter {
       throw ArgumentError(
           'Row without a DBRecord id: ${item['id']} (${item['id'].runtimeType})');
     }
-    final cached = _cache[id];
-    if (cached != null) {
-      if (cached is T) {
-        return cached as T;
-      }
-      throw StateError(
-          'Record $id is cached as ${cached.runtimeType} but requested as $T');
-    }
+    final cached = _cachedAs<T>(id);
+    if (cached != null) return cached;
     final dataclass = await registration.loader(item);
     if (dataclass is DBModifiableClass) {
       dataclass._loadId = id;
@@ -250,10 +255,23 @@ class DBDataClassAdapter extends Adapter {
         throw StateError(
             'Dataclass id should only be dependent on the contents of the dataclass expected $id got ${dataclass.dbId}');
       }
+      // The loader may be async: a concurrent load or save can have claimed
+      // this record meanwhile, and there must stay one live instance per
+      // record.
+      final winner = _cachedAs<T>(id);
+      if (winner != null) return winner;
       _cache[id] = dataclass;
       _liveFor(registration.table);
     }
     return dataclass as T;
+  }
+
+  T? _cachedAs<T extends DBConstClass>(DBRecord id) {
+    final cached = _cache[id];
+    if (cached == null) return null;
+    if (cached is T) return cached as T;
+    throw StateError(
+        'Record $id is cached as ${cached.runtimeType} but requested as $T');
   }
 
   void registerDataClass<T extends DBConstClass>(
@@ -394,8 +412,11 @@ class DBDataClassAdapter extends Adapter {
       final live = _lives[table.tb];
       if (live == null) return;
       live.watchers--;
-      if (live.watchers <= 0 && !live.dead) {
-        // Last watcher left: kill the live query. The dispatch listener goes
+      // Cached instances depend on this live query too, and a cache hit does
+      // not re-establish it.
+      final stillNeeded = _cache.keys.any((id) => id.tb == table.tb);
+      if (live.watchers <= 0 && !live.dead && !stillNeeded) {
+        // Last user left: kill the live query. The dispatch listener goes
         // down with it; a new watcher or registration re-establishes it.
         _lives.remove(table.tb);
         await live.sub?.cancel();
