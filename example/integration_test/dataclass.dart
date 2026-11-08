@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:metis/adapter/dataclass.dart';
+import 'package:metis/adapter/sync/repo.dart';
 import 'package:metis/metis.dart';
 
 class TestData with DBConstClass, DBModifiableClass {
@@ -127,6 +128,56 @@ class LiveTestData with DBConstClass, DBModifiableClass, DBLiveClass {
   }
 }
 
+/// A live class whose instance can hold unsaved edits.
+class DocData with DBConstClass, DBModifiableClass, DBLiveClass {
+  final String key;
+  Map<String, dynamic> fields;
+  final changes = <DBChange>[];
+  Duration handleDelay = Duration.zero;
+  final handled = <int>[];
+
+  DocData(this.key, this.fields);
+
+  factory DocData.fromJson(Map<String, dynamic> json) => DocData(
+      (json['id'] as DBRecord).id as String,
+      Map<String, dynamic>.from(json)..remove('id'));
+
+  @override
+  DBRecord get dbId => DBRecord('DocData', key);
+
+  @override
+  Map<String, dynamic> toDBJson() => fields;
+
+  @override
+  Future<void> onDBChange(DBChange change) async {
+    final index = changes.length;
+    changes.add(change);
+    if (change.state != null) fields = change.state!;
+    if (handleDelay > Duration.zero) await Future.delayed(handleDelay);
+    handled.add(index);
+  }
+}
+
+/// Modifiable, but ignores database-side changes.
+class PlainData with DBConstClass, DBModifiableClass {
+  final String key;
+  int a;
+  int b;
+
+  PlainData(this.key, this.a, this.b);
+
+  factory PlainData.fromJson(Map<String, dynamic> json) => PlainData(
+      (json['id'] as DBRecord).id as String,
+      json['a'] as int,
+      json['b'] as int);
+
+  @override
+  DBRecord get dbId => DBRecord('PlainData', key);
+
+  @override
+  Map<String, dynamic> toDBJson() => {'a': a, 'b': b};
+}
+
 void main() {
   setUpAll(() async => await SurrealDB.ensureInitialized());
   dotest();
@@ -154,6 +205,171 @@ void dotest() {
         const DBTable('ConstTestData'), ConstTestData.fromJson);
     data.registerDataClass(
         const DBTable('LiveTestData'), LiveTestData.fromJson);
+    data.registerDataClass(const DBTable('DocData'), DocData.fromJson);
+    data.registerDataClass(const DBTable('PlainData'), PlainData.fromJson);
+  });
+
+  group('diff saves', () {
+    const settle = Duration(milliseconds: 100);
+
+    Future<DocData> loaded(Map<String, dynamic> row) async {
+      await db.upsert(const DBRecord('DocData', 'd'), row);
+      final doc = await data.selectDataClass<DocData>(
+          const DBRecord('DocData', 'd'));
+      await Future.delayed(settle);
+      return doc!;
+    }
+
+    Future<Map<dynamic, dynamic>> row() async =>
+        await db.select(const DBRecord('DocData', 'd')) as Map;
+
+    test('a stale instance does not overwrite other fields', () async {
+      final doc = await loaded({'a': 1, 'b': 1});
+      await db.query(r'UPDATE $id SET b = 2;',
+          vars: {'id': doc.dbId}); // arrives through sync or a raw query
+      doc.fields['a'] = 9; // edited before the change was applied
+      await data.save(doc);
+      final stored = await row();
+      expect(stored['a'], 9);
+      expect(stored['b'], 2);
+    });
+
+    test('a non-live instance does not overwrite other fields', () async {
+      await db.upsert(const DBRecord('PlainData', 'p'), {'a': 1, 'b': 1});
+      final plain = await data
+          .selectDataClass<PlainData>(const DBRecord('PlainData', 'p'));
+      await Future.delayed(settle);
+      await db.upsert(plain!.dbId, {'a': 1, 'b': 2});
+      await Future.delayed(settle);
+      plain.a = 9;
+      await data.save(plain);
+      expect(await db.select(plain.dbId),
+          containsPair('b', 2));
+    });
+
+    test('nested edits leave sibling keys alone', () async {
+      final doc = await loaded({
+        'm': {
+          'x': {'v': 1},
+          'y': {'v': 1},
+        }
+      });
+      await db.query(r'UPDATE $id SET m.y.v = 2;', vars: {'id': doc.dbId});
+      doc.fields['m']['x']['v'] = 9;
+      await data.save(doc);
+      final m = (await row())['m'] as Map;
+      expect(m['x']['v'], 9);
+      expect(m['y']['v'], 2);
+    });
+
+    test('removed keys are removed', () async {
+      final doc = await loaded({'a': 1, 'gone': 1});
+      doc.fields.remove('gone');
+      await data.save(doc);
+      expect((await row()).containsKey('gone'), isFalse);
+    });
+
+    test('keys holding slashes are written correctly', () async {
+      final doc = await loaded({'m': <String, dynamic>{}});
+      doc.fields['m']['https://x.y/1'] = 5;
+      await data.save(doc);
+      expect((await row())['m'], {'https://x.y/1': 5});
+    });
+
+    test('an unchanged save writes nothing', () async {
+      const tables = {
+        SyncTable(
+            table: DBTable('DocData'),
+            version: 1,
+            range: VersionRange.exact(1)),
+      };
+      final crdt = await db.setCrdtAdapter(tablesToSync: tables);
+      final doc = await loaded({'a': 1});
+      final before = await crdt.syncRepo.getSyncData(doc.dbId);
+      await data.save(doc);
+      await Future.delayed(settle);
+      final after = await crdt.syncRepo.getSyncData(doc.dbId);
+      expect(after!.hlc.toString(), before!.hlc.toString());
+    });
+
+    test('a second save sends only the new difference', () async {
+      final doc = await loaded({'a': 1, 'b': 1});
+      doc.fields['a'] = 2;
+      await data.save(doc);
+      await db.query(r'UPDATE $id SET b = 5;', vars: {'id': doc.dbId});
+      await Future.delayed(settle);
+      doc.fields['b'] = 5;
+      doc.fields['a'] = 3;
+      await data.save(doc);
+      expect(await row(), containsPair('a', 3));
+      expect(await row(), containsPair('b', 5));
+    });
+
+    test('a save recreates a row that disappeared', () async {
+      final doc = await loaded({'a': 1});
+      await db.query(r'DELETE $id;', vars: {'id': doc.dbId});
+      doc.fields['a'] = 2;
+      // The delete notification may not have arrived yet.
+      await data.save(doc);
+      await Future.delayed(settle);
+      if (!doc.deleted) expect((await row())['a'], 2);
+    });
+
+    test('full writes rows whose stored shape differs', () async {
+      await db.upsert(
+          const DBRecord('DocData', 'old'), {'a': 1, 'legacy': true});
+      final doc = await data
+          .selectDataClass<DocData>(const DBRecord('DocData', 'old'));
+      await Future.delayed(settle);
+      doc!.fields = {'a': 1, 'legacy': true, 'added': 1};
+      doc.fields.remove('legacy');
+      await data.save(doc, full: true);
+      final stored =
+          await db.select(const DBRecord('DocData', 'old')) as Map;
+      expect(stored.containsKey('legacy'), isFalse);
+      expect(stored['added'], 1);
+    });
+
+    test('live changes carry the row with unsaved edits on top', () async {
+      final doc = await loaded({'a': 1, 'b': 1});
+      doc.fields['a'] = 9; // unsaved
+      await db.query(r'UPDATE $id SET b = 2;', vars: {'id': doc.dbId});
+      await Future.delayed(settle);
+      expect(doc.changes.single.state, {'a': 9, 'b': 2});
+    });
+
+    test('unsaved edits are not undone by the following save', () async {
+      final doc = await loaded({'a': 1, 'b': 1});
+      doc.fields['a'] = 9;
+      await db.query(r'UPDATE $id SET b = 2;', vars: {'id': doc.dbId});
+      await Future.delayed(settle);
+      doc.fields = doc.changes.single.state!;
+      await data.save(doc);
+      expect(await row(), containsPair('a', 9));
+      expect(await row(), containsPair('b', 2));
+    });
+
+    test('text edits arrive as plain replaces', () async {
+      const text = 'abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz';
+      const edited = 'abcdefghijklmnopqrstuvwxyz ABCdefghijklmnopqrstuvwxyz';
+      final doc = await loaded({'s': text});
+      await db.upsert(doc.dbId, {'s': edited});
+      await Future.delayed(settle);
+      final change = doc.changes.single;
+      expect(change.patch.single['op'], 'replace');
+      expect(change.patch.single['value'], edited);
+      expect(change.state, {'s': edited});
+    });
+
+    test('changes are handled one at a time, in order', () async {
+      final doc = await loaded({'a': 0});
+      doc.handleDelay = const Duration(milliseconds: 30);
+      for (var i = 1; i <= 3; i++) {
+        await db.upsert(doc.dbId, {'a': i});
+      }
+      await Future.delayed(const Duration(milliseconds: 250));
+      expect(doc.handled, [0, 1, 2]);
+    });
   });
 
   test('Can use a dataclass to store and retrieve data', () async {

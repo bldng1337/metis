@@ -5,7 +5,11 @@ import 'dart:io';
 import 'package:crdt/crdt.dart';
 import 'package:flutter_surrealdb/flutter_surrealdb.dart';
 import 'package:metis/adapter/migration.dart';
+import 'package:metis/adapter/sync/fields.dart';
 import 'package:uuid/uuid_value.dart';
+
+export 'package:metis/adapter/sync/fields.dart'
+    show FieldCrdt, FieldMap, FieldDoc, SyncOrder;
 
 /// Tag used to mark SurrealDB native types in the JSON sync payload so the
 /// revive function can reconstruct them.
@@ -16,10 +20,15 @@ class SyncData {
   DBRecord entry;
   bool deleted;
 
+  /// Per node, the newest write this row has seen. Only set for tables synced
+  /// with a [FieldCrdt].
+  Map<String, Hlc>? heads;
+
   SyncData({
     required this.hlc,
     required this.deleted,
     required this.entry,
+    this.heads,
   });
 
   factory SyncData.fromDB(Map<String, dynamic> db) {
@@ -38,6 +47,8 @@ class SyncData {
               base64.encode(utf8.encode(json.encode(id.id)))),
       deleted: db['deleted'] as bool,
       entry: db['entry'] as DBRecord,
+      heads: (db['heads'] as Map?)?.map((node, stamp) =>
+          MapEntry(node as String, FieldDoc.stampFromDB(stamp))),
     );
   }
 
@@ -46,12 +57,18 @@ class SyncData {
         deleted = json['deleted'],
         entry = json['entry'] is DBRecord
             ? json['entry']
-            : DBRecord.fromJson(json['entry']);
+            : DBRecord.fromJson(json['entry']),
+        heads = (json['heads'] as Map?)?.map((node, stamp) =>
+            MapEntry(node as String, Hlc.parse(stamp as String)));
 
   Map<String, dynamic> toJson() => {
         'hlc': hlc.toString(),
         'deleted': deleted,
         'entry': entry.toJson(),
+        if (heads != null)
+          'heads': {
+            for (final e in heads!.entries) e.key: e.value.toString(),
+          },
       };
 
   Map<String, dynamic> toDB() => {
@@ -60,10 +77,29 @@ class SyncData {
         'deleted': deleted,
         'entry': entry,
         'node': hlc.nodeId,
+        if (heads != null)
+          'heads': {
+            for (final e in heads!.entries)
+              e.key: FieldDoc.stampToDB(e.value),
+          },
       };
 
   int compareTo(SyncData other) {
     return hlc.compareTo(other.hlc).sign;
+  }
+
+  /// How this row relates to [other]. With [heads] two rows can be concurrent;
+  /// without them the newer HLC simply wins.
+  SyncOrder orderAgainst(SyncData other) {
+    if (heads == null && other.heads == null) {
+      return switch (compareTo(other)) {
+        < 0 => SyncOrder.older,
+        > 0 => SyncOrder.newer,
+        _ => SyncOrder.same,
+      };
+    }
+    return compareHeads(
+        heads ?? {hlc.nodeId: hlc}, other.heads ?? {other.hlc.nodeId: other.hlc});
   }
 
   @override
@@ -77,28 +113,40 @@ class SyncTable {
   final int version;
   final VersionRange range;
 
+  /// Merges this table per field instead of per row.
+  final FieldCrdt? fields;
+
+  final String? _remoteFingerprint;
+
   const SyncTable({
     required this.table,
     required this.version,
     required this.range,
-  });
+    this.fields,
+  }) : _remoteFingerprint = null;
+
+  String? get fieldsFingerprint => fields?.fingerprint ?? _remoteFingerprint;
 
   SyncTable.fromJson(Map<String, dynamic> json)
       : table = json['table'] is String
             ? DBTable(json['table'])
             : DBTable.fromJson(json['table'] as Map<String, dynamic>),
         version = json['version'],
-        range = VersionRange.fromJson(json['range']);
+        range = VersionRange.fromJson(json['range']),
+        fields = null,
+        _remoteFingerprint = json['fields'] as String?;
 
   Map<String, dynamic> toJson() => {
         'table': table.toJson(),
         'version': version,
         'range': range.toJson(),
+        if (fieldsFingerprint != null) 'fields': fieldsFingerprint,
       };
   bool match(SyncTable other) =>
       table.tb == other.table.tb &&
       range.match(other.version) &&
-      other.range.match(version);
+      other.range.match(version) &&
+      fieldsFingerprint == other.fieldsFingerprint;
 }
 
 class SyncRepoData {
@@ -218,16 +266,23 @@ abstract class SyncRepo {
       await push(remotemeta, await remote.pull(remotemeta));
       return true;
     }
-    switch (local.compareTo(remotemeta)) {
-      case -1:
+    switch (local.orderAgainst(remotemeta)) {
+      case SyncOrder.older:
         // local Hlc is older -> remote wins, push remote data to local.
         await push(remotemeta, await remote.pull(remotemeta));
         return true;
-      case 0:
+      case SyncOrder.same:
         return false;
       // local Hlc is newer -> local wins, push local data to remote.
-      default:
+      case SyncOrder.newer:
         await remote.push(local, await pull(local));
+        return true;
+      // Both sides have writes the other lacks: merge here, then send the
+      // merged row back.
+      case SyncOrder.concurrent:
+        await push(remotemeta, await remote.pull(remotemeta));
+        final merged = await getSyncData(id);
+        if (merged != null) await remote.push(merged, await pull(merged));
         return true;
     }
   }
@@ -265,15 +320,18 @@ abstract class SyncRepo {
             await push(remotesync, await remote.pull(remotesync));
             return;
           }
-          switch (localsync.compareTo(remotesync)) {
+          switch (localsync.orderAgainst(remotesync)) {
             // local Hlc is older -> remote wins, push remote data to local.
-            case -1:
+            // Concurrent rows merge on push; the reverse pass then sees the
+            // merged row as newer and sends it back.
+            case SyncOrder.older:
+            case SyncOrder.concurrent:
               await push(remotesync, await remote.pull(remotesync));
               break;
-            case 0:
+            case SyncOrder.same:
               break;
             // local Hlc is newer -> local wins, push local data to remote.
-            case 1:
+            case SyncOrder.newer:
               deferred.add((localsync, await pull(localsync)));
               break;
           }

@@ -134,6 +134,42 @@ Future<void> enableSync(AdapterSurrealDB db) async {
 }
 ```
 
+### 4) Merge per field instead of per row
+
+By default the newest write to a row replaces the whole row on every device.
+Declare a `FieldCrdt` on a `SyncTable` to merge parts of the row independently:
+
+```dart
+const SyncTable(
+  table: DBTable('entry'),
+  version: 1,
+  range: VersionRange.exact(1),
+  fields: FieldCrdt(
+    groups: {'source': ['entry', 'original']}, // one stamp, copied together
+    passive: {'source'}, // does not keep a deleted row alive
+    lww: {'note': null, 'episode': 0}, // field -> default
+    maps: {
+      'episodedata': FieldMap( // must be stored as an object
+        fields: {'bookmark': false, 'finished': false},
+        sets: {'quotes'},
+      ),
+    },
+    sets: {'categories'}, // merged per element
+    derived: {'sort_read'}, // never stamped
+    recompute: recomputeColumns, // rebuilds derived fields after a merge
+  ),
+);
+```
+
+Both peers must declare the same schema. Fields not declared share one group.
+
+### 5) Writes that should not count as changes
+
+`DBDataClassAdapter.save` writes only what changed on a modifiable instance.
+A migration that rewrites rows into a new shape needs `save(item, full: true)`,
+and should run inside `crdt.runUnstamped(...)` so the rewrite keeps each row's
+timestamp.
+
 ## Exports
 
 `package:metis/metis.dart` exports:

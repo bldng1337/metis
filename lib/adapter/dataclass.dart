@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter_surrealdb/flutter_surrealdb.dart';
 import 'package:metis/adapter.dart';
+import 'package:metis/adapter/json_diff.dart';
 import 'package:metis/client.dart';
 import 'package:uuid/uuid_value.dart';
 import 'package:weak_cache/weak_cache.dart';
@@ -26,6 +27,10 @@ mixin DBModifiableClass on DBConstClass {
   /// arrived yet. Kept on the instance (not in an adapter-side map) so it
   /// can never outlive the instance the weak cache tracks.
   int _pendingEcho = 0;
+
+  /// The row as last read or written, in [toDBJson]'s shape. Saves send only
+  /// what differs from it.
+  Map<String, dynamic>? _baseline;
 
   bool get deleted => _deleted;
 }
@@ -52,7 +57,12 @@ class DBChange {
   /// Whether the row was deleted.
   final bool deleted;
 
-  const DBChange({this.patch = const [], this.deleted = false});
+  /// The row after this change with the instance's unsaved edits re-applied,
+  /// in [DBConstClass.toDBJson]'s shape. Null for deletes and when the
+  /// instance has no known database state.
+  final Map<String, dynamic>? state;
+
+  const DBChange({this.patch = const [], this.deleted = false, this.state});
 
   @override
   String toString() => 'DBChange(patch: $patch, deleted: $deleted)';
@@ -62,7 +72,9 @@ class DBChange {
 ///
 /// [onDBChange] is invoked whenever the row behind the instance changes without going through this adapter (raw queries, sync pushes, other clients). Writes made through [DBDataClassAdapter.save]/[DBDataClassAdapter.delete] on the same instance are suppressed. The patch is the database's own diff of the committed transition, so every path can be applied unconditionally to the last database state; a path intersecting locally modified (unsaved) fields is a conflict the implementor must resolve.
 mixin DBLiveClass on DBModifiableClass {
-  void onDBChange(DBChange change) {}
+  /// Changes are delivered one at a time: the next waits for a returned
+  /// future.
+  FutureOr<void> onDBChange(DBChange change) {}
 }
 
 /// Error context handed to the per-registration [DBLiveErrorHook] when the live query for a registered table fails terminally.
@@ -103,6 +115,9 @@ class _LiveSubscription {
   StreamSubscription<Notification>? sub;
   int watchers = 0;
   bool dead = false;
+
+  /// Serializes notification handling, which can await the instance.
+  Future<void> dispatch = Future.value();
 
   /// Completes once the live query is registered with the database (on
   /// failure, after the error was routed through the live error handling).
@@ -152,7 +167,11 @@ class DBDataClassAdapter extends Adapter {
     invalidate(data.dbId);
   }
 
-  Future<void> save(DBConstClass data) async {
+  /// Persists [data]. A modifiable instance that knows its database state
+  /// writes only the fields it changed, so a concurrent change to other
+  /// fields survives. [full] writes the whole row instead, which migrations
+  /// need to rewrite rows whose stored shape differs from [toDBJson].
+  Future<void> save(DBConstClass data, {bool full = false}) async {
     if (data is DBModifiableClass && data.deleted) return;
     final json = Map<String, dynamic>.from(await data.toDBJson())..remove('id');
     // The live query must be active before the write commits so the write's
@@ -164,7 +183,7 @@ class DBDataClassAdapter extends Adapter {
       await _moveRecord(data, json);
       return;
     }
-    await _writeRecord(data, json);
+    await _writeRecord(data, json, full: full);
   }
 
   void _armEcho(DBModifiableClass data, DBRecord id) {
@@ -183,31 +202,66 @@ class DBDataClassAdapter extends Adapter {
     data._pendingEcho--;
   }
 
-  Future<void> _writeRecord(
-      DBConstClass data, Map<String, dynamic> json) async {
+  Future<void> _writeRecord(DBConstClass data, Map<String, dynamic> json,
+      {bool full = false}) async {
     if (data is! DBModifiableClass) {
       await db.upsert(data.dbId, json);
       return;
     }
-    final wasCached = identical(_cache[data.dbId], data);
-    _armEcho(data, data.dbId);
-    final bool changed;
-    try {
-      changed = await _upsertReportingChange(data.dbId, json);
-    } catch (e) {
-      _disarmEcho(data, data.dbId, wasCached: wasCached);
-      rethrow;
+    final baseline = data._baseline;
+    if (full || baseline == null) {
+      await _writeWhole(data, json);
+      return;
     }
-    if (!changed && data._pendingEcho > 0) data._pendingEcho--;
+    final ops = diffJson(baseline, json);
+    if (ops.isEmpty) return;
+    final rows = await _writeTracked(
+        data,
+        json,
+        r'UPDATE $id PATCH $ops RETURN DIFF;',
+        {'id': data.dbId, 'ops': ops});
+    // UPDATE matches nothing when the row is gone.
+    if (rows is List && rows.isEmpty) {
+      _releaseEcho(data);
+      await _writeWhole(data, json);
+    }
   }
 
-  Future<bool> _upsertReportingChange(
-      DBRecord id, Map<String, dynamic> json) async {
-    final result = await db.query(r'UPSERT $id CONTENT $data RETURN DIFF;',
-        vars: {'id': id, 'data': json});
-    final rows = result[0];
-    return rows is! List ||
-        rows.any((ops) => ops is! List || ops.isNotEmpty);
+  Future<void> _writeWhole(
+      DBModifiableClass data, Map<String, dynamic> json) async {
+    await _writeTracked(data, json, r'UPSERT $id CONTENT $data RETURN DIFF;',
+        {'id': data.dbId, 'data': json});
+  }
+
+  /// Runs a write of [json] with its echo armed and returns the statement's
+  /// rows. The baseline moves first so a change arriving during the write
+  /// patches the new state.
+  Future<Object?> _writeTracked(DBModifiableClass data,
+      Map<String, dynamic> json, String query, Map<String, dynamic> vars) async {
+    final wasCached = identical(_cache[data.dbId], data);
+    final previous = data._baseline;
+    final next = deepCopyJson(json);
+    _armEcho(data, data.dbId);
+    data._baseline = next;
+    final Object? rows;
+    try {
+      rows = (await db.query(query, vars: vars))[0];
+    } catch (e) {
+      _disarmEcho(data, data.dbId, wasCached: wasCached);
+      if (identical(data._baseline, next)) data._baseline = previous;
+      rethrow;
+    }
+    if (rows is List &&
+        rows.isNotEmpty &&
+        rows.every((ops) => ops is List && ops.isEmpty)) {
+      // An unchanged row produces no live notification to consume the echo.
+      _releaseEcho(data);
+    }
+    return rows;
+  }
+
+  void _releaseEcho(DBModifiableClass data) {
+    if (data._pendingEcho > 0) data._pendingEcho--;
   }
 
   Future<void> _moveRecord(
@@ -216,6 +270,7 @@ class DBDataClassAdapter extends Adapter {
     final wasCached = identical(_cache[data.dbId], data);
     _cache.remove(oldId);
     _armEcho(data, data.dbId);
+    data._baseline = deepCopyJson(json);
     try {
       await db.query(
           """
@@ -255,16 +310,22 @@ class DBDataClassAdapter extends Adapter {
         throw StateError(
             'Dataclass id should only be dependent on the contents of the dataclass expected $id got ${dataclass.dbId}');
       }
+      final baseline = await _snapshot(dataclass);
       // The loader may be async: a concurrent load or save can have claimed
       // this record meanwhile, and there must stay one live instance per
       // record.
       final winner = _cachedAs<T>(id);
       if (winner != null) return winner;
+      dataclass._baseline = baseline;
       _cache[id] = dataclass;
       _liveFor(registration.table);
     }
     return dataclass as T;
   }
+
+  Future<Map<String, dynamic>> _snapshot(DBConstClass data) async =>
+      deepCopyJson(Map<String, dynamic>.from(await data.toDBJson())
+        ..remove('id'));
 
   T? _cachedAs<T extends DBConstClass>(DBRecord id) {
     final cached = _cache[id];
@@ -458,7 +519,8 @@ class DBDataClassAdapter extends Adapter {
     // The adapter itself consumes the stream for cache maintenance. Errors
     // are handled by _onLiveError through the hooks; nothing to do here.
     live.controller.stream.listen(
-      (event) => unawaited(_dispatchNotification(table, event)),
+      (event) => live.dispatch =
+          live.dispatch.then((_) => _dispatchNotification(table, event)),
       onError: (Object e, StackTrace s) {},
     );
     live.ready = _registerLive(table, live);
@@ -545,7 +607,7 @@ class DBDataClassAdapter extends Adapter {
         if (instance == null) return;
         instance._deleted = true;
         if (instance is DBLiveClass) {
-          _invokeOnChange(instance, const DBChange(deleted: true));
+          await _invokeOnChange(instance, const DBChange(deleted: true));
         }
         return;
       }
@@ -558,7 +620,6 @@ class DBDataClassAdapter extends Adapter {
         instance._pendingEcho--; // own echo
         return;
       }
-      if (instance is! DBLiveClass) return;
       final result = event.result;
       if (result is! List) return; // the live query runs in diff mode
       final ops = [
@@ -566,15 +627,59 @@ class DBDataClassAdapter extends Adapter {
           if (e is Map) Map<String, dynamic>.from(e)
       ];
       if (ops.isEmpty) return; // write did not change the row
-      _invokeOnChange(instance, DBChange(patch: ops));
+      // An instance that ignores changes keeps its baseline, so its stale
+      // fields do not look like edits.
+      if (instance is! DBLiveClass) return;
+      final patch = await _resolveChangeOps(id, ops);
+      final state = await _stateAfter(instance, patch);
+      await _invokeOnChange(instance, DBChange(patch: patch, state: state));
+      // Only now: a save during the handler must still diff against the state
+      // the instance is holding.
+      final baseline = instance._baseline;
+      if (baseline != null) {
+        applyJsonOps(baseline, patch);
+        baseline.remove('id');
+      }
     } catch (e, s) {
       Zone.current.handleUncaughtError(e, s);
     }
   }
 
-  void _invokeOnChange(DBLiveClass instance, DBChange change) {
+  /// The live feed reports string edits as `change` ops holding a text patch;
+  /// turns them into plain replaces.
+  Future<List<Map<String, dynamic>>> _resolveChangeOps(
+      DBRecord id, List<Map<String, dynamic>> ops) async {
+    if (ops.every((op) => op['op'] != 'change')) return ops;
+    final row = await _selectRow(id);
+    return [
+      for (final op in ops)
+        if (op['op'] == 'change')
+          {
+            'op': 'replace',
+            'path': op['path'],
+            'value': readJsonPointer(row, op['path'] as String),
+          }
+        else
+          op,
+    ];
+  }
+
+  /// The row after [patch] with the instance's unsaved edits on top.
+  Future<Map<String, dynamic>?> _stateAfter(
+      DBLiveClass instance, List<Map<String, dynamic>> patch) async {
+    final baseline = instance._baseline;
+    if (baseline == null) return null;
+    final edits = diffJson(baseline, await _snapshot(instance));
+    final state = deepCopyJson(baseline);
+    applyJsonOps(state, patch);
+    state.remove('id');
+    applyJsonOps(state, edits);
+    return state;
+  }
+
+  Future<void> _invokeOnChange(DBLiveClass instance, DBChange change) async {
     try {
-      instance.onDBChange(change);
+      await instance.onDBChange(change);
     } catch (e, s) {
       Zone.current.handleUncaughtError(e, s);
     }

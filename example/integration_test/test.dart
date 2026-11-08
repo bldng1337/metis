@@ -3,6 +3,7 @@ import 'package:metis/metis.dart';
 
 import 'crdt.dart' as crdt;
 import 'dataclass.dart' as dataclass;
+import 'field_crdt.dart' as field_crdt;
 import 'fuzz_sync.dart' as fuzz;
 import 'migration.dart' as migration;
 import 'share_tag.dart' as share_tag;
@@ -14,6 +15,7 @@ void main() {
   setUpAll(() async => await SurrealDB.ensureInitialized());
   group('CRDT', crdt.dotest);
   group('Dataclass', dataclass.dotest);
+  group('FieldCrdt', field_crdt.dotest);
   group('Fuzz', fuzz.dotest);
   group('Migration', migration.dotest);
   group('ShareTag', share_tag.dotest);

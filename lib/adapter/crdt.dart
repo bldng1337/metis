@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter_surrealdb/flutter_surrealdb.dart';
 import 'package:metis/adapter.dart';
 import 'package:metis/adapter/migration.dart';
+import 'package:metis/adapter/sync/fields.dart';
 import 'package:metis/adapter/sync/repo.dart';
 import 'package:metis/client.dart';
 import 'package:metis/store.dart';
@@ -31,8 +32,9 @@ class CrdtAdapterRepo extends SyncRepo {
   /// push semantics). Bumped when the format changes so mixed-version peers
   /// fail negotiation with VersionMismatchException instead of
   /// misinterpreting each other's requests. v2: offset pagination -> cursor
-  /// pagination, push applies only strictly-newer HLCs.
-  static const version = 2;
+  /// pagination, push applies only strictly-newer HLCs. v3: heads and field
+  /// documents for tables synced with a [FieldCrdt].
+  static const version = 3;
 
   final CrdtAdapter adapter;
 
@@ -73,6 +75,11 @@ class CrdtAdapterRepo extends SyncRepo {
     if (!adapter.tablesToSync.any((e) => e.table.tb == meta.entry.tb)) {
       return null;
     }
+    if (adapter._fieldSchemas.containsKey(meta.entry.tb)) {
+      final doc = await adapter.db.writeTransaction(
+          (txn) => adapter._readFieldDoc(txn, meta.entry));
+      return doc?.toWire();
+    }
     final data = await adapter.db.select(meta.entry);
     return data;
   }
@@ -80,6 +87,13 @@ class CrdtAdapterRepo extends SyncRepo {
   @override
   Future<void> push(SyncData meta, dynamic data) async {
     if (!adapter.tablesToSync.any((e) => e.table.tb == meta.entry.tb)) {
+      return;
+    }
+    final schema = adapter._fieldSchemas[meta.entry.tb];
+    if (schema != null) {
+      if (!FieldDoc.isWire(data)) return;
+      await adapter._applyFieldDoc(schema, meta.entry,
+          FieldDoc.fromWire(Map<String, dynamic>.from(data as Map)));
       return;
     }
     final payload =
@@ -138,7 +152,16 @@ class CrdtAdapter extends Adapter {
 
   /// The tables that should be synced.
   final Set<SyncTable> tablesToSync;
-  static const version = 2;
+  static const version = 3;
+
+  late final Map<String, FieldCrdt> _fieldSchemas = {
+    for (final t in tablesToSync)
+      if (t.fields != null) t.table.tb: t.fields!,
+  };
+
+  /// Holds the per-field stamps of tables synced with a [FieldCrdt], one row
+  /// per record, keyed like the CRDT table.
+  String get fieldsTableName => '${crdtTableName}_fields';
 
   static bool _validIdentifier(String name) =>
       RegExp(r'^[a-zA-Z0-9_]+$').hasMatch(name);
@@ -172,6 +195,7 @@ class CrdtAdapter extends Adapter {
     _checkIdentifier(migrationTableName, 'migrationTableName');
     for (final t in tablesToSync) {
       _checkIdentifier(t.table.tb, 'synced table name');
+      t.fields?.validate();
     }
   }
 
@@ -229,6 +253,7 @@ class CrdtAdapter extends Adapter {
         DEFINE FIELD deleted ON TABLE $crdtTableName TYPE bool COMMENT 'If the record was deleted';
         DEFINE FIELD entry ON TABLE $crdtTableName TYPE record COMMENT 'The record that was modified';
         DEFINE FIELD node ON TABLE $crdtTableName TYPE string COMMENT 'The node id of the replica that last wrote the record';
+        DEFINE FIELD heads ON TABLE $crdtTableName TYPE option<object> FLEXIBLE COMMENT 'Per node, the newest write this row has seen';
         """
         .trim());
   }
@@ -243,10 +268,28 @@ class CrdtAdapter extends Adapter {
         "node": nodeId,
       });
     }
+    if (from < 3) {
+      await db.query(
+          'DEFINE FIELD IF NOT EXISTS heads ON TABLE $crdtTableName '
+          'TYPE option<object> FLEXIBLE;');
+    }
   }
 
   Future<void> _initTableSync() async {
+    if (_fieldSchemas.isNotEmpty) {
+      await db.query('DEFINE TABLE IF NOT EXISTS $fieldsTableName SCHEMALESS;');
+    }
     for (final table in tablesToSync) {
+      final schema = table.fields;
+      if (schema != null) {
+        final body = fieldEventBody(schema,
+            crdtTable: crdtTableName,
+            fieldsTable: fieldsTableName,
+            nodeId: nodeId);
+        await db.query(
+            'DEFINE EVENT OVERWRITE sync ON ${table.table.tb} THEN {\n$body};');
+        continue;
+      }
       //TODO: This is a possible injection point but as far as I can tell its not possible to use the vars for a define statement 2.0
       await db.query("""
           DEFINE EVENT OVERWRITE sync ON ${table.table.tb} THEN {
@@ -272,6 +315,100 @@ class CrdtAdapter extends Adapter {
           };
         """);
     }
+  }
+
+  Future<void>? _unstampedPause;
+  int _unstampedUsers = 0;
+
+  /// Runs [body] with change tracking off, so its writes keep the rows'
+  /// existing timestamps. Meant for migrations, which rewrite every row and
+  /// would otherwise make the last device to upgrade win everywhere. Other
+  /// writes during [body] go untracked as well, so run it before anything
+  /// else touches the database.
+  Future<T> runUnstamped<T>(Future<T> Function() body) async {
+    _unstampedUsers++;
+    try {
+      await (_unstampedPause ??= _removeSyncEvents());
+      return await body();
+    } finally {
+      if (--_unstampedUsers == 0) {
+        _unstampedPause = null;
+        await _initTableSync();
+      }
+    }
+  }
+
+  Future<void> _removeSyncEvents() async {
+    for (final table in tablesToSync) {
+      await db.query('REMOVE EVENT IF EXISTS sync ON ${table.table.tb};');
+    }
+  }
+
+  DBRecord _getFieldsRecord(DBRecord record) {
+    return DBRecord(fieldsTableName, [record.tb, record.id]);
+  }
+
+  Future<FieldDoc?> _readFieldDoc(
+      SurrealTransaction txn, DBRecord record) async {
+    final crdtRow = await txn.select(_getSyncRecord(record));
+    if (crdtRow == null) return null;
+    final meta = SyncData.fromDB(Map<String, dynamic>.from(crdtRow as Map));
+    final side = await txn.select(_getFieldsRecord(record));
+    final row = meta.deleted ? null : await txn.select(record);
+    final (stamps, marks) = FieldDoc.parseFields(side?['fields'] as Map?);
+    return FieldDoc(
+      row: row == null
+          ? null
+          : (Map<String, dynamic>.from(row as Map)..remove('id')),
+      deleted: meta.deleted || row == null,
+      hlc: meta.hlc,
+      base: side?['base'] == null
+          ? meta.hlc
+          : FieldDoc.stampFromDB(side!['base']),
+      stamps: stamps,
+      marks: marks,
+      heads: meta.heads ?? {meta.hlc.nodeId: meta.hlc},
+    );
+  }
+
+  Future<void> _applyFieldDoc(
+      FieldCrdt schema, DBRecord record, FieldDoc incoming) async {
+    await db.writeTransaction((txn) async {
+      final current = await _readFieldDoc(txn, record);
+      final FieldDoc result;
+      if (current == null) {
+        result = incoming;
+      } else {
+        switch (compareHeads(incoming.heads, current.heads)) {
+          case SyncOrder.older:
+          case SyncOrder.same:
+            return;
+          case SyncOrder.newer:
+            result = incoming;
+          case SyncOrder.concurrent:
+            result = mergeFieldDocs(schema, current, incoming);
+        }
+      }
+      if (result.deleted) {
+        await txn.query('DELETE FROM \$entry;', vars: {'entry': record});
+      } else {
+        await txn.query('UPSERT \$entry CONTENT \$data;',
+            vars: {'entry': record, 'data': result.row});
+      }
+      await txn.query('UPSERT \$meta CONTENT \$crdt;', vars: {
+        'meta': _getSyncRecord(record),
+        'crdt': SyncData(
+                hlc: result.hlc,
+                deleted: result.deleted,
+                entry: record,
+                heads: result.heads)
+            .toDB(),
+      });
+      await txn.query('UPSERT \$side CONTENT \$fields;', vars: {
+        'side': _getFieldsRecord(record),
+        'fields': result.sidecarToDB(),
+      });
+    });
   }
 
   Future<void> removeSyncTable(SyncTable table) async {
