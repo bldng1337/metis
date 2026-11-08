@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:crdt/crdt.dart';
 import 'package:flutter_surrealdb/flutter_surrealdb.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -290,6 +293,149 @@ void main() {
     });
   });
 
+  group('SyncRepo.sync with equal timestamps', () {
+    final ts = DateTime.utc(2024, 1, 1);
+    SyncData at(int count, String node) => SyncData(
+        hlc: Hlc(ts, count, node),
+        deleted: false,
+        entry: const DBRecord('t', 'r'));
+
+    for (final gap in [1, 2, 5]) {
+      test('the newer side wins with a counter gap of $gap', () async {
+        final newer = at(gap, 'remote');
+        final local = _PagingRepo([at(0, 'local')]);
+        final remote = _PagingRepo([newer]);
+
+        await local.sync(remote);
+
+        expect(local.pushed.map((e) => e.$1.hlc), contains(newer.hlc));
+        expect(remote.pushed, isEmpty);
+      });
+    }
+  });
+
+  group('SyncRepo.sync record failures', () {
+    final base = DateTime.utc(2024, 1, 1);
+    SyncData row(String id) => SyncData(
+        hlc: Hlc(base, 0, 'remote'),
+        deleted: false,
+        entry: DBRecord('t', id));
+
+    test('a failing record does not stop the others', () async {
+      final remote = _PagingRepo([row('r0'), row('bad'), row('r2')])
+        ..pullError = (id) => id == 'bad' ? StateError('poisoned') : null;
+      final local = _PagingRepo(<SyncData>[]);
+
+      await expectLater(
+        local.sync(remote, chunkSize: 1),
+        throwsA(isA<SyncIncompleteException>()
+            .having((e) => e.failures.single.entry.id, 'failed record', 'bad')
+            .having((e) => e.failures.single.error, 'cause',
+                isA<StateError>())),
+      );
+      expect(local.pushed.map((e) => e.$1.entry.id), ['r0', 'r2']);
+    });
+
+    test('a failing push of a local-newer record does not stop the others',
+        () async {
+      SyncData mine(String id) => SyncData(
+          hlc: Hlc(base.add(const Duration(hours: 1)), 0, 'local'),
+          deleted: false,
+          entry: DBRecord('t', id));
+      final remote = _PagingRepo([row('a'), row('b')])
+        ..pushError = (id) => id == 'a' ? StateError('rejected') : null;
+      final local = _PagingRepo([mine('a'), mine('b')]);
+
+      await expectLater(
+          local.sync(remote), throwsA(isA<SyncIncompleteException>()));
+      expect(remote.pushed.map((e) => e.$1.entry.id), contains('b'));
+    });
+
+    for (final (name, error) in <(String, Object)>[
+      ('socket error', const SocketException('gone')),
+      ('timeout', TimeoutException('gone')),
+    ]) {
+      test('a $name aborts instead of failing every record', () async {
+        final remote = _PagingRepo([row('r0'), row('r1'), row('r2')])
+          ..pullError = (id) => id == 'r1' ? error : null;
+        final local = _PagingRepo(<SyncData>[]);
+
+        await expectLater(local.sync(remote), throwsA(same(error)));
+        expect(local.pushed.map((e) => e.$1.entry.id), ['r0']);
+      });
+    }
+  });
+
+  group('SyncHttpClient', () {
+    late HttpServer server;
+    late SyncHttpClient client;
+
+    Future<void> serve(void Function(HttpRequest req) handler) async {
+      server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      server.listen(handler);
+      client = SyncHttpClient(
+        url: 'http://${server.address.host}:${server.port}',
+        client: HttpClient(),
+        requestTimeout: const Duration(milliseconds: 150),
+      );
+    }
+
+    tearDown(() async {
+      client.dispose();
+      await server.close(force: true);
+    });
+
+    test('times out when the peer never answers', () async {
+      await serve((req) {});
+      await expectLater(
+          client.getSyncPointData(), throwsA(isA<TimeoutException>()));
+    });
+
+    test('times out when the peer stalls mid-response', () async {
+      await serve((req) {
+        req.response
+          ..statusCode = HttpStatus.ok
+          ..contentLength = 1000
+          ..write('{"partial":');
+        req.response.flush();
+      });
+      await expectLater(
+          client.getSyncPointData(), throwsA(isA<TimeoutException>()));
+    });
+
+    test('a sync against a hung peer fails instead of hanging', () async {
+      await serve((req) {});
+      await expectLater(_PagingRepo(<SyncData>[]).sync(client),
+          throwsA(isA<TimeoutException>()));
+    });
+
+    test('reports an error response as SyncHttpException', () async {
+      await serve((req) async {
+        await req.drain<void>();
+        req.response
+          ..statusCode = HttpStatus.internalServerError
+          ..write('nope');
+        await req.response.close();
+      });
+      await expectLater(
+        client.getSyncPointData(),
+        throwsA(isA<SyncHttpException>()
+            .having((e) => e.statusCode, 'status', 500)
+            .having((e) => e.message, 'message', 'nope')),
+      );
+    });
+  });
+
+  test('SyncHttpClient keeps a connection timeout the caller already set', () {
+    final http = HttpClient()..connectionTimeout = const Duration(seconds: 3);
+    SyncHttpClient(url: 'http://x', client: http);
+    expect(http.connectionTimeout, const Duration(seconds: 3));
+
+    final fresh = HttpClient();
+    SyncHttpClient(url: 'http://x', client: fresh);
+    expect(fresh.connectionTimeout, isNotNull);
+  });
+
   group('SyncRepo.syncRecord', () {
     const entry = DBRecord('t', 'r');
     SyncData meta(DateTime ts, int count, String node) => SyncData(
@@ -297,6 +443,21 @@ void main() {
           deleted: false,
           entry: entry,
         );
+
+    test('pulls the newer remote with a counter gap above one', () async {
+      final ts = DateTime.utc(2024, 1, 1);
+      final local = _MockSyncRepo(
+        pointData: const SyncRepoData(version: 1, entries: 1, tables: {}),
+        records: {entry: meta(ts, 0, 'a')},
+      );
+      final remote = _MockSyncRepo(
+        pointData: const SyncRepoData(version: 1, entries: 1, tables: {}),
+        records: {entry: meta(ts, 3, 'b')},
+      );
+      expect(await local.syncRecord(remote, entry), isTrue);
+      expect(local.pushed.single.$1.hlc, remote.records[entry]!.hlc);
+      expect(remote.pushed, isEmpty);
+    });
 
     test('pushes local to remote when local is newer', () async {
       final local = _MockSyncRepo(
@@ -441,6 +602,10 @@ class _PagingRepo extends SyncRepo {
   /// walker; lets a test mutate [rows] like a concurrent writer would.
   void Function(List<SyncData> page)? onAfterPage;
 
+  /// Return an error to make pulling or pushing that record id fail with it.
+  Object? Function(Object? id)? pullError;
+  Object? Function(Object? id)? pushError;
+
   _PagingRepo(this.rows, {Set<SyncTable>? tables})
       : tables = tables ??
             {
@@ -478,11 +643,24 @@ class _PagingRepo extends SyncRepo {
   }
 
   @override
-  Future<dynamic> pull(SyncData meta) async => {'v': meta.entry.id};
+  Future<dynamic> pull(SyncData meta) async {
+    final error = pullError?.call(meta.entry.id);
+    if (error != null) throw error;
+    return {'v': meta.entry.id};
+  }
 
   @override
   Future<void> push(SyncData meta, dynamic data) async {
-    rows.add(meta);
+    final error = pushError?.call(meta.entry.id);
+    if (error != null) throw error;
+    // One row per record, like the CRDT table; a duplicate would also stall
+    // the keyset cursor above.
+    final index = rows.indexWhere((r) => r.entry == meta.entry);
+    if (index >= 0) {
+      rows[index] = meta;
+    } else {
+      rows.add(meta);
+    }
     pushed.add((meta, data));
   }
 }

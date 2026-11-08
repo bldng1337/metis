@@ -63,7 +63,7 @@ class SyncData {
       };
 
   int compareTo(SyncData other) {
-    return hlc.compareTo(other.hlc);
+    return hlc.compareTo(other.hlc).sign;
   }
 
   @override
@@ -180,17 +180,20 @@ abstract class SyncRepo {
             repotable.version);
       }
     }
-    await _syncdata(remote, remotedata.entries,
-        syncTables: localdata.tables.map((e) => e.table.tb).toSet(),
-        chunkSize: chunkSize,
-        onProgress: (progress, total) =>
-            onProgress?.call(progress, remotedata.entries + localdata.entries));
-    await remote._syncdata(this, localdata.entries,
-        syncTables: remotedata.tables.map((e) => e.table.tb).toSet(),
-        chunkSize: chunkSize,
-        onProgress: (progress, total) => onProgress?.call(
-            progress + remotedata.entries,
-            remotedata.entries + localdata.entries));
+    final failures = [
+      ...await _syncdata(remote, remotedata.entries,
+          syncTables: localdata.tables.map((e) => e.table.tb).toSet(),
+          chunkSize: chunkSize,
+          onProgress: (progress, total) => onProgress?.call(
+              progress, remotedata.entries + localdata.entries)),
+      ...await remote._syncdata(this, localdata.entries,
+          syncTables: remotedata.tables.map((e) => e.table.tb).toSet(),
+          chunkSize: chunkSize,
+          onProgress: (progress, total) => onProgress?.call(
+              progress + remotedata.entries,
+              remotedata.entries + localdata.entries)),
+    ];
+    if (failures.isNotEmpty) throw SyncIncompleteException(failures);
   }
 
   /// Synchronizes the single record identified by [id] with [remote],
@@ -229,10 +232,20 @@ abstract class SyncRepo {
     }
   }
 
-  Future<void> _syncdata(SyncRepo remote, int length,
+  Future<List<SyncRecordFailure>> _syncdata(SyncRepo remote, int length,
       {Set<String>? syncTables,
       int chunkSize = 50,
       void Function(int progress, int total)? onProgress}) async {
+    final failures = <SyncRecordFailure>[];
+    Future<void> attempt(DBRecord entry, Future<void> Function() body) async {
+      try {
+        await body();
+      } catch (e, s) {
+        if (_isConnectionFailure(e)) rethrow;
+        failures.add(SyncRecordFailure(entry, e, s));
+      }
+    }
+
     final deferred = <(SyncData, dynamic)>[];
     DBRecord? after;
     int processed = 0;
@@ -246,29 +259,57 @@ abstract class SyncRepo {
         if (syncTables != null && !syncTables.contains(remotesync.entry.tb)) {
           continue;
         }
-        final localsync = await getSyncData(remotesync.entry);
-        if (localsync == null) {
-          await push(remotesync, await remote.pull(remotesync));
-          continue;
-        }
-        switch (localsync.compareTo(remotesync)) {
-          // local Hlc is older -> remote wins, push remote data to local.
-          case -1:
+        await attempt(remotesync.entry, () async {
+          final localsync = await getSyncData(remotesync.entry);
+          if (localsync == null) {
             await push(remotesync, await remote.pull(remotesync));
-            break;
-          case 0:
-            break;
-          // local Hlc is newer -> local wins, push local data to remote.
-          case 1:
-            deferred.add((localsync, await pull(localsync)));
-            break;
-        }
+            return;
+          }
+          switch (localsync.compareTo(remotesync)) {
+            // local Hlc is older -> remote wins, push remote data to local.
+            case -1:
+              await push(remotesync, await remote.pull(remotesync));
+              break;
+            case 0:
+              break;
+            // local Hlc is newer -> local wins, push local data to remote.
+            case 1:
+              deferred.add((localsync, await pull(localsync)));
+              break;
+          }
+        });
       }
     }
     for (final (meta, data) in deferred) {
-      await remote.push(meta, data);
+      await attempt(meta.entry, () => remote.push(meta, data));
     }
+    return failures;
   }
+}
+
+bool _isConnectionFailure(Object error) =>
+    error is IOException || error is TimeoutException;
+
+class SyncRecordFailure {
+  final DBRecord entry;
+  final Object error;
+  final StackTrace stackTrace;
+
+  const SyncRecordFailure(this.entry, this.error, this.stackTrace);
+
+  @override
+  String toString() => 'SyncRecordFailure($entry: $error)';
+}
+
+class SyncIncompleteException implements Exception {
+  final List<SyncRecordFailure> failures;
+
+  const SyncIncompleteException(this.failures);
+
+  @override
+  String toString() =>
+      'SyncIncompleteException: ${failures.length} record(s) failed, '
+      'first: ${failures.first}';
 }
 
 class VersionMismatchException implements Exception {
@@ -293,23 +334,37 @@ class SyncHttpClient extends SyncRepo {
   final String url;
   final HttpClient client;
 
+  final Duration requestTimeout;
+
   SyncHttpClient({
     required this.url,
     required this.client,
-  });
+    this.requestTimeout = const Duration(seconds: 30),
+  }) {
+    client.connectionTimeout ??= const Duration(seconds: 10);
+  }
 
   Future<String> _request(String path, Object? body) async {
-    final uri = syncUri(url, path);
-    final request = await client.postUrl(uri);
-    request.headers.contentType = ContentType.json;
-    request.write(jsonEncode(body, toEncodable: serializer));
-    final response = await request.close();
-    if (response.statusCode != HttpStatus.ok) {
-      final error = await utf8.decoder.bind(response).join();
-      throw HttpException(
-          'Request failed with status: ${response.statusCode}, error: $error');
+    HttpClientRequest? request;
+    Future<String> send() async {
+      final opened = await client.postUrl(syncUri(url, path));
+      request = opened;
+      opened.headers.contentType = ContentType.json;
+      opened.write(jsonEncode(body, toEncodable: serializer));
+      final response = await opened.close();
+      final content = await utf8.decoder.bind(response).join();
+      if (response.statusCode != HttpStatus.ok) {
+        throw SyncHttpException(response.statusCode, content);
+      }
+      return content;
     }
-    return await utf8.decoder.bind(response).join();
+
+    try {
+      return await send().timeout(requestTimeout);
+    } on TimeoutException {
+      request?.abort();
+      rethrow;
+    }
   }
 
   @override
