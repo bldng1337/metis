@@ -275,9 +275,34 @@ class CrdtAdapter extends Adapter {
     }
   }
 
-  Future<void> _initTableSync() async {
+  String get _eventScriptKey => 'crdt_events_$crdtTableName';
+
+  Future<void> _initTableSync({bool force = false}) async {
+    final script = _syncEventScript();
+    final store = KeyValueStore(db, migrationTableName);
+    if (!force) {
+      try {
+        if (await store.get(_eventScriptKey) == script) return;
+      } catch (_) {
+        // Missing migration table: nothing applied yet.
+      }
+    }
+    await db.query(script);
+    await store.set(_eventScriptKey, script);
+  }
+
+  Future<void> _forgetEventScript() async {
+    try {
+      await KeyValueStore(db, migrationTableName).delete(_eventScriptKey);
+    } catch (_) {
+      // Missing migration table: nothing to forget.
+    }
+  }
+
+  String _syncEventScript() {
+    final out = StringBuffer();
     if (_fieldSchemas.isNotEmpty) {
-      await db.query('DEFINE TABLE IF NOT EXISTS $fieldsTableName SCHEMALESS;');
+      out.writeln('DEFINE TABLE IF NOT EXISTS $fieldsTableName SCHEMALESS;');
     }
     for (final table in tablesToSync) {
       final schema = table.fields;
@@ -286,12 +311,12 @@ class CrdtAdapter extends Adapter {
             crdtTable: crdtTableName,
             fieldsTable: fieldsTableName,
             nodeId: nodeId);
-        await db.query(
+        out.writeln(
             'DEFINE EVENT OVERWRITE sync ON ${table.table.tb} THEN {\n$body};');
         continue;
       }
       //TODO: This is a possible injection point but as far as I can tell its not possible to use the vars for a define statement 2.0
-      await db.query("""
+      out.writeln("""
           DEFINE EVENT OVERWRITE sync ON ${table.table.tb} THEN {
           // Writes that do not change the record (remote applies of data we
           // already hold, re-saves of unchanged state) must not restamp the
@@ -315,6 +340,7 @@ class CrdtAdapter extends Adapter {
           };
         """);
     }
+    return out.toString();
   }
 
   Future<void>? _unstampedPause;
@@ -333,12 +359,13 @@ class CrdtAdapter extends Adapter {
     } finally {
       if (--_unstampedUsers == 0) {
         _unstampedPause = null;
-        await _initTableSync();
+        await _initTableSync(force: true);
       }
     }
   }
 
   Future<void> _removeSyncEvents() async {
+    await _forgetEventScript();
     for (final table in tablesToSync) {
       await db.query('REMOVE EVENT IF EXISTS sync ON ${table.table.tb};');
     }
@@ -414,6 +441,7 @@ class CrdtAdapter extends Adapter {
   Future<void> removeSyncTable(SyncTable table) async {
     final name = table.table.tb;
     _checkIdentifier(name, 'synced table name');
+    await _forgetEventScript();
     await db.query('REMOVE EVENT IF EXISTS sync ON $name;');
   }
 
