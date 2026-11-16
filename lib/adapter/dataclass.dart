@@ -402,6 +402,17 @@ class DBDataClassAdapter extends Adapter {
     yield* _load(_rowsAsMaps(data[0]));
   }
 
+  /// Loads rows the caller already fetched, through the identity cache like
+  /// [queryDataClasses]. Lets a caller post-process raw rows before
+  /// hydration, e.g. resolve record links in one bulk lookup instead of a
+  /// per-row FETCH.
+  Stream<T> loadDataClasses<T extends DBConstClass>(Iterable<Object?> rows) {
+    if (!_classes.containsKey(T)) {
+      throw StateError('Class $T not registered');
+    }
+    return _load<T>(_rowsAsMaps(rows));
+  }
+
   /// Watches [table] and repeatedly yields the full current list of
   /// records, accumulated from the initial snapshot plus live events.
   ///
